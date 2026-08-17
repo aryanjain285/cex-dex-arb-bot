@@ -536,16 +536,37 @@ class UniV3DexClient(DexClient):
             params.min_amount_out, 0, params.token_out_decimals
         )
 
+        # Exactly the seven fields ABI/router.json declares, in its order.
+        #
+        # This previously included a `deadline`, which the struct does not have.
+        # Verified against the deployed contracts: the ABI is the SwapRouter02 ABI
+        # (selector 0x04e45aaf, seven fields, no deadline) and all three configured
+        # routers dispatch that selector -- so the ABI and the chain agreed, and the
+        # CALLER was wrong. The failure would have been at encoding time, in this
+        # process, on the first real swap.
+        #
+        # Consequence worth stating rather than papering over: SwapRouter02's
+        # exactInputSingle cannot take a deadline at all. Deadline protection there
+        # is `multicall(uint256 deadline, bytes[] data)`, which ABI/router.json does
+        # not include. So `dex.swap_deadline_seconds` is UNENFORCEABLE on this path.
+        # For an arbitrage swap that matters -- one landing late is a guaranteed
+        # loss, not a late win -- so wrapping this call in multicall is required
+        # before any real execution, and it is listed as such in the README.
         swap_params_struct = {
             'tokenIn': token_in_addr,
             'tokenOut': token_out_addr,
             'fee': params.fee,
             'recipient': self.user_address,
-            'deadline': int(clock.now()) + self.dex_config.swap_deadline_seconds,
             'amountIn': amount_in_wei,
             'amountOutMinimum': amount_out_minimum,
-            'sqrtPriceLimitX96': 0
+            'sqrtPriceLimitX96': 0,
         }
+        logger.warning(
+            f"Swap has NO deadline: SwapRouter02's exactInputSingle does not accept "
+            f"one, and dex.swap_deadline_seconds "
+            f"({self.dex_config.swap_deadline_seconds}s) cannot be applied here. "
+            f"Wrap this call in multicall(deadline, data) before trading real size."
+        )
         logger.info(
             f"Swap floor: {params.min_amount_out} token-out units "
             f"({amount_out_minimum} raw), from a {params.slippage_bps} bps "

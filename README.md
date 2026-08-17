@@ -83,7 +83,7 @@ not more code.
 | Paper trading | Working, and enforces the same deadline and sanity gates as live |
 | Backtest | Rebuilt against the current interfaces; gas must be present in the data |
 | Universe survey | `survey` answers "does a tradeable spread exist" without any paid API key |
-| Test suite | 464 passing, 1 skipped. `pytest tests/ -q` |
+| Test suite | 491 passing, 1 skipped. `pytest tests/ -q` |
 
 ### Not yet implemented
 
@@ -103,10 +103,22 @@ not more code.
 
 ### Known issues to address before live trading
 
-1. **Router ABI mismatch.** The swap call passes a `deadline` field, but the
-   configured router addresses are SwapRouter02, which removed `deadline` from
-   that struct. **Unverified and unresolved** — check the ABI against the deployed
-   contract at each configured address before any swap.
+1. **`dex.swap_deadline_seconds` cannot be enforced on the swap path.** Now
+   verified rather than suspected. `ABI/router.json` is the SwapRouter02 ABI
+   (`exactInputSingle`, selector `0x04e45aaf`, seven fields, no `deadline`), and
+   the configured Ethereum, Arbitrum and Base routers all dispatch that selector —
+   so the ABI and the chain agree. What disagreed was the caller, which built an
+   eight-key struct including a `deadline` the struct does not have; that is fixed,
+   and a test compares the built keys against the ABI.
+
+   The consequence remains: SwapRouter02's `exactInputSingle` accepts no deadline,
+   so deadline protection requires wrapping the call in
+   `multicall(uint256 deadline, bytes[] data)` — which this ABI does not include.
+   For an arbitrage swap that matters, since one landing late is a guaranteed loss
+   rather than a late win. The code logs a warning on every swap saying so. **Wrap
+   it in multicall before trading real size.** The BSC router
+   (`0xB971eF87…`) is Uniswap's documented SwapRouter02 there but has not had its
+   bytecode checked, because no BSC RPC was configured.
 2. **No authenticated endpoint has been exercised.** Order placement,
    cancellation and balance reads are tested against recorded Binance response
    shapes, not against the exchange. They need a testnet run with real keys.
