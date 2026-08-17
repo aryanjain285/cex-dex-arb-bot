@@ -29,9 +29,12 @@ def _app_config(enable_rebalance=True) -> AppConfig:
             router="0x" + "11" * 20, quoter_v2="0x" + "22" * 20, weth="0x" + "33" * 20)}),
         cex=CexConfig(name="binance", base_url="https://x", ws_url="wss://x/ws",
                       api_key_env="A", api_secret_env="B", recv_window_ms=5000),
-        risk=RiskConfig(max_notional_per_leg_quote=10000, max_position_per_asset=2.0,
+        # Coherent with target_notional_usd: AppConfig now rejects a cap far
+        # above the largest size the strategy can produce, because such a cap
+        # can never fire. The original 10000 here was exactly that defect.
+        risk=RiskConfig(max_notional_per_leg_quote=1200, max_position_per_asset=2.0,
                         circuit_breaker_bps=250, cancel_all_on_start=False,
-                        cancel_all_on_shutdown=False),
+                        cancel_all_on_shutdown=False, max_daily_loss_quote=250.0),
         inventory=InventoryConfig(rebalance=RebalanceConfig(
             enable=enable_rebalance, target_ratio=0.5, trigger_bps=500, method="on_cex")),
         observability=ObservabilityConfig(metrics_port=9000, log_level="INFO", redact_keys=[]),

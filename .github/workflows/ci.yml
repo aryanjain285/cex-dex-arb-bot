@@ -1,0 +1,132 @@
+name: CI
+
+# This workflow exists because of a specific incident. A helper function was
+# refactored into calling itself:
+#
+#     def install_event_loop_policy():
+#         if uvloop is not None:
+#             install_event_loop_policy()   # should have been uvloop.install()
+#
+# On Windows `uvloop` is unimportable, so the guard short-circuited and the bug
+# was invisible on the development machine. On Linux -- the only deployment
+# target -- every CLI command died with RecursionError at startup. The full test
+# suite passed throughout.
+#
+# The lesson is not "write better tests"; it is that a test suite which never
+# runs on the deployment platform cannot see platform-conditional bugs. So CI
+# runs on Linux, and on the Python version the dependencies are actually
+# pinned for.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: tests (linux, py${{ matrix.python }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 3.11 is what requirements.txt pins for; 3.12 is a forward-looking
+        # canary so an upgrade is a deliberate decision rather than a surprise.
+        python: ["3.11", "3.12"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install coverage
+
+      - name: Confirm uvloop is importable
+        # If this fails, the platform-conditional branch under test is not
+        # actually being exercised and this job proves nothing about it.
+        run: python -c "import uvloop; print('uvloop', uvloop.__version__)"
+
+      - name: Byte-compile everything
+        # Catches syntax and indentation errors that a partially-run test suite
+        # can miss. A patch script has already broken app.py this way once.
+        run: python -m compileall -q src backtest tests
+
+      - name: Run tests
+        env:
+          PYTHONUTF8: "1"
+        run: coverage run --source=src -m pytest tests/ -q
+
+      - name: Coverage report
+        run: coverage report --sort=cover
+
+      - name: Smoke-test every CLI entry point
+        # The recursion bug lived in a code path that no unit test touched but
+        # every CLI invocation ran. --help reaches module import and command
+        # registration, which is exactly where it failed.
+        env:
+          PYTHONUTF8: "1"
+          BINANCE_API_KEY: ci-placeholder
+          BINANCE_API_SECRET: ci-placeholder
+          DEX_WALLET_PRIVATE_KEY: "0x1111111111111111111111111111111111111111111111111111111111111111"
+        run: |
+          set -e
+          python -m src.cli.main --help > /dev/null
+          for cmd in run paper autodiscover rebalance check-dex-balance \
+                     discover-pairs lookup-pool spike-run backtest; do
+            echo "--- $cmd --help"
+            python -m src.cli.main "$cmd" --help > /dev/null
+          done
+
+      - name: Verify config loads
+        env:
+          PYTHONUTF8: "1"
+          BINANCE_API_KEY: ci-placeholder
+          BINANCE_API_SECRET: ci-placeholder
+          DEX_WALLET_PRIVATE_KEY: "0x1111111111111111111111111111111111111111111111111111111111111111"
+        run: |
+          python - <<'PY'
+          from src.core.config import load_config
+          c = load_config()
+          # Cross-checks that only fail when config and code disagree.
+          assert c.risk.max_notional_per_leg_quote <= 5 * c.strategy.target_notional_usd, (
+              "max_notional_per_leg_quote is unreachable: trade size derives from "
+              "target_notional_usd, so a cap far above it can never fire"
+          )
+          assert c.strategy.max_book_age_seconds <= 1.0, "staleness guard too loose"
+          print("config OK")
+          PY
+
+  no-secrets:
+    name: no committed credentials
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Scan for credential patterns
+        # A live third-party API key was previously committed in six subgraph
+        # URLs and shipped in the repository history.
+        run: |
+          set -e
+          fail=0
+          if grep -rIn --exclude-dir=.git --exclude-dir=node_modules \
+               -E 'gateway\.thegraph\.com/api/[0-9a-f]{16,}' . ; then
+            echo "::error::A Graph API key appears to be hardcoded."
+            fail=1
+          fi
+          if grep -rIn --exclude-dir=.git --exclude-dir=node_modules \
+               --exclude='*.md' --exclude='ci.yml' \
+               -E '(DEX_WALLET_PRIVATE_KEY|BINANCE_API_SECRET)\s*=\s*["'"'"'][^"'"'"'$][^"'"'"']{8,}' . ; then
+            echo "::error::A secret appears to be assigned inline."
+            fail=1
+          fi
+          test "$fail" -eq 0 && echo "no committed credentials found"

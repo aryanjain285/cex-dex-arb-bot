@@ -453,6 +453,84 @@ class AppConfig(BaseModel):
     secrets: SecretsConfig = Field(default_factory=SecretsConfig.load)
     scanner: ScannerConfig = Field(default_factory=ScannerConfig)
 
+    @model_validator(mode='after')
+    def validate_coherence(self) -> 'AppConfig':
+        """Reject configurations whose parts are individually valid but jointly
+        incoherent.
+
+        Every audit found at least one instance of the same pattern: a setting
+        that looks like a limit, validates fine on its own, and cannot possibly
+        fire given another setting. That is worse than an absent limit, because
+        an operator reads it and believes they are protected.
+
+        `env: "prod"` additionally requires the controls that only matter with
+        real capital. It is the only place in this codebase where `env` changes
+        behaviour -- previously it was read nowhere and `run` behaved
+        identically under dev and prod.
+        """
+        notional = float(self.strategy.target_notional_usd)
+        cap = float(self.risk.max_notional_per_leg_quote)
+
+        # Trade size ALWAYS derives from target_notional_usd, so a cap far above
+        # it is unreachable by construction. This was the live defect: a 10x gap
+        # meant the only enforced risk gate could never fire.
+        if cap > 5 * notional:
+            raise ValueError(
+                f"risk.max_notional_per_leg_quote ({cap}) is unreachable: trade "
+                f"size always derives from strategy.target_notional_usd "
+                f"({notional}), so a cap above ~1.2x it can never fire. Set it "
+                f"near the target notional or raise the notional deliberately."
+            )
+        if cap < notional:
+            raise ValueError(
+                f"risk.max_notional_per_leg_quote ({cap}) is below "
+                f"strategy.target_notional_usd ({notional}): every trade would "
+                f"be rejected, and the bot would run indefinitely without "
+                f"trading while appearing healthy."
+            )
+
+        loss_limit = self.risk.max_daily_loss_quote
+        if loss_limit is not None and loss_limit < 0.05 * notional:
+            raise ValueError(
+                f"risk.max_daily_loss_quote ({loss_limit}) is small relative to "
+                f"a {notional} notional: a single ordinary losing trade would "
+                f"halt the system, which reads as a malfunction rather than a "
+                f"risk control."
+            )
+
+        # Pairs must be quotable. A pair on a chain with no DEX contracts logs a
+        # warning every cycle forever and never trades.
+        known_chains = set(self.dex.uniswap_v3)
+        for pair in self.pairs:
+            if pair.dex_chain not in known_chains:
+                raise ValueError(
+                    f"pair {pair.cex_symbol} is configured for chain "
+                    f"'{pair.dex_chain}', which has no dex.uniswap_v3 entry. "
+                    f"Known chains: {sorted(known_chains)}."
+                )
+
+        if self.env == "prod":
+            if self.risk.max_daily_loss_quote is None:
+                raise ValueError(
+                    "env: prod requires risk.max_daily_loss_quote. Running with "
+                    "real capital and no daily loss limit is not a configuration "
+                    "this system will accept."
+                )
+            if not self.strategy.rotation.enabled:
+                raise ValueError(
+                    "env: prod requires strategy.rotation.enabled. Disabling it "
+                    "asserts that moving inventory between venues is free, which "
+                    "is defensible only while measuring in paper mode."
+                )
+            if not self.observability.evaluation_store_enabled:
+                raise ValueError(
+                    "env: prod requires observability.evaluation_store_enabled. "
+                    "A run with no audit trail cannot be reconstructed "
+                    "afterwards, so its results cannot be trusted or disputed."
+                )
+        return self
+
+
 
 def load_config(
     default_path: str = "config/default.yaml",
