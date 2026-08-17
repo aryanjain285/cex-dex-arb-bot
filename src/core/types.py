@@ -8,6 +8,7 @@ ZERO = Decimal("0")
 
 __all__ = [
     "MarketPair",
+    "BookSnapshot",
     "Quote",
     "Opportunity",
     "CexOrder",
@@ -38,13 +39,46 @@ class MarketPair(BaseModel):
     is_synthetic: bool = False
     intermediate_symbol: Optional[str] = None
     # --- Optional fields for strategy parameters ---
-    min_edge_bps: Optional[int] = None
+    # Per-pair override of StrategyConfig.min_net_bps: the minimum net edge,
+    # after taker fee and gas, required to act on this pair.
+    min_net_bps: Optional[Decimal] = None
+    # Execution slippage tolerance, used only to derive amountOutMinimum for
+    # the on-chain swap. This is NOT a cost and never enters the economics.
     max_slippage_bps: Optional[int] = None
     max_size_quote: Optional[int] = None
     price_floor_quote: Optional[Decimal] = None
     price_ceiling_quote: Optional[Decimal] = None
     max_edge_bps: Optional[int] = None
-    edge_safety_multiplier: Optional[Decimal] = None
+
+@dataclass
+class BookSnapshot:
+    """A point-in-time order book ladder, deep enough to price a real trade.
+
+    `bids` are ordered best-first (descending price) and `asks` best-first
+    (ascending price), matching what `costs.walk_book` expects. `timestamp`
+    is unix epoch seconds from `core.clock`, so staleness is checkable.
+
+    This exists because pricing from top-of-book alone is only valid for
+    trades smaller than the top level, which is not the case for the thin
+    pools this strategy targets.
+    """
+
+    pair: "MarketPair"
+    bids: List[tuple]
+    asks: List[tuple]
+    timestamp: float
+
+    @property
+    def best_bid(self) -> Optional[Decimal]:
+        return self.bids[0][0] if self.bids else None
+
+    @property
+    def best_ask(self) -> Optional[Decimal]:
+        return self.asks[0][0] if self.asks else None
+
+    def age_seconds(self, now: float) -> float:
+        return now - self.timestamp
+
 
 class Quote(BaseModel):
     pair: MarketPair

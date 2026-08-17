@@ -54,6 +54,40 @@ class DexContracts(BaseModel):
 class DexConfig(BaseModel):
     uniswap_v3: Dict[str, DexContracts]
 
+    # Gas units assumed for a single-hop V3 swap when pricing a quote. The
+    # real figure is only knowable via estimate_gas after an approval exists,
+    # so this is an explicit assumption rather than a hidden literal. Verify
+    # it against actual receipts before trading size.
+    swap_gas_estimate_units: int = 200_000
+
+    # Deadline placed on a swap transaction, in seconds. Must be short: an
+    # arbitrage swap that lands minutes late is a guaranteed loss, not a
+    # late win. The original value was 600s.
+    swap_deadline_seconds: int = 60
+
+    # How long a fetched native-token USD price stays fresh, in seconds.
+    native_price_ttl_seconds: float = 60.0
+
+    # How long a stale native price may still be served after a failed
+    # refresh, in seconds. Beyond this, gas cannot be priced and quotes are
+    # declined rather than guessed.
+    native_price_stale_grace_seconds: float = 120.0
+
+    @model_validator(mode='after')
+    def validate_dex(self) -> 'DexConfig':
+        if self.swap_gas_estimate_units <= 0:
+            raise ValueError("swap_gas_estimate_units must be positive")
+        if not 0 < self.swap_deadline_seconds <= 120:
+            raise ValueError(
+                "swap_deadline_seconds must be in (0, 120]: a long deadline lets "
+                "a stale arbitrage transaction land at a loss"
+            )
+        if self.native_price_ttl_seconds <= 0:
+            raise ValueError("native_price_ttl_seconds must be positive")
+        if self.native_price_stale_grace_seconds < 0:
+            raise ValueError("native_price_stale_grace_seconds must be non-negative")
+        return self
+
 class CexConfig(BaseModel):
     name: str
     base_url: str
@@ -185,15 +219,67 @@ class ScannerConfig(BaseModel):
 
 
 class StrategyConfig(BaseModel):
-    target_notional_usd: int = 10
-    min_edge_bps: int
-    max_slippage_bps: int
+    """Global strategy parameters.
+
+    Every value that affects a trading decision lives here rather than as a
+    literal in the code. `min_net_bps` is the single knob that decides whether
+    an opportunity is worth taking: it is compared against net basis points
+    after the taker fee and gas have been deducted, so it means what it says.
+    """
+
+    # Target notional per trade, in the quote currency.
+    target_notional_usd: int = 1000
+
+    # CEX taker fee in basis points. Binance spot is 10.0 standard, or 7.5
+    # with the BNB fee-burn discount enabled. Check yours under Wallet > Fees.
+    taker_fee_bps: Decimal = Decimal("7.5")
+
+    # Minimum net edge, in basis points, required to act. Net means after the
+    # taker fee and gas. This replaces the old min_edge_bps/slippage pair,
+    # which double-counted price impact already present in the DEX quote.
+    min_net_bps: Decimal = Decimal("5")
+
+    # Reject any computed net edge above this as bad data rather than acting
+    # on it. Guards against unit and decimals errors reaching the executor.
+    max_net_bps_sanity: Decimal = Decimal("1000")
+
+    # How long a detected opportunity stays actionable, in seconds.
+    opportunity_ttl_seconds: float = 2.0
+
+    # Idle sleep between detection cycles when nothing was found, in seconds.
+    loop_interval_seconds: float = 0.2
+
+    # TTL for the cached intermediate-asset CEX price used by synthetic pairs.
+    intermediate_price_cache_seconds: float = 2.0
+
+    # Reject an order book older than this, in seconds. A stalled feed would
+    # otherwise be indistinguishable from a quiet market.
+    max_book_age_seconds: float = 5.0
+
+    @model_validator(mode='after')
+    def validate_strategy(self) -> 'StrategyConfig':
+        if self.target_notional_usd <= 0:
+            raise ValueError("target_notional_usd must be positive")
+        if self.taker_fee_bps < 0:
+            raise ValueError("taker_fee_bps must be non-negative")
+        if self.min_net_bps < 0:
+            raise ValueError("min_net_bps must be non-negative")
+        if self.max_net_bps_sanity <= self.min_net_bps:
+            raise ValueError("max_net_bps_sanity must exceed min_net_bps")
+        for name in ("opportunity_ttl_seconds", "loop_interval_seconds",
+                     "intermediate_price_cache_seconds", "max_book_age_seconds"):
+            if getattr(self, name) <= 0:
+                raise ValueError(f"{name} must be positive")
+        return self
 
 class PairConfig(BaseModel):
     base: str
     quote: str
     cex_symbol: str
-    min_edge_bps: int
+    # Optional per-pair override of StrategyConfig.min_net_bps.
+    min_net_bps: Optional[Decimal] = None
+    # Execution slippage tolerance only -- used to derive amountOutMinimum.
+    # It is not a cost and does not enter the trade economics.
     max_slippage_bps: int
     max_size_quote: int
     dex_chain: str
@@ -201,7 +287,6 @@ class PairConfig(BaseModel):
     price_floor_quote: Optional[Decimal] = None
     price_ceiling_quote: Optional[Decimal] = None
     max_edge_bps: Optional[int] = None
-    edge_safety_multiplier: Optional[Decimal] = None
     base_precision: Optional[int] = None
     quote_precision: Optional[int] = None
 

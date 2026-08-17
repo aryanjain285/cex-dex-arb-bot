@@ -10,8 +10,9 @@ import aiohttp
 import websockets
 from loguru import logger
 
+from ..core import clock
 from ..core.config import CexConfig, SecretsConfig
-from ..core.types import MarketPair, Quote
+from ..core.types import BookSnapshot, MarketPair, Quote
 from .cex_base import CexClient, CexOrder, OrderUpdate
 from ..infra import metrics
 
@@ -41,6 +42,9 @@ class BinanceCexClient(CexClient):
         self._listen_key_keepalive_task: Optional[asyncio.Task] = None
         self.orderbooks: Dict[str, Dict[str, Decimal]] = {p.cex_symbol.replace('/', ''): {'bids': {}, 'asks': {}} for p in self.pairs}
         self.last_update_ids: Dict[str, int] = {}
+        # Unix epoch seconds when each book last received a snapshot or diff.
+        # Lets a stalled stream be detected instead of read as a quiet market.
+        self._book_synced_at: Dict[str, float] = {}
         self._listen_key: Optional[str] = None
         self._closing = False
         self._order_pair_cache: Dict[str, MarketPair] = {}
@@ -291,6 +295,7 @@ class BinanceCexClient(CexClient):
                 self.last_update_ids[symbol] = data['lastUpdateId']
                 self.orderbooks[symbol]['bids'] = {Decimal(price): Decimal(qty) for price, qty in data['bids']}
                 self.orderbooks[symbol]['asks'] = {Decimal(price): Decimal(qty) for price, qty in data['asks']}
+                self._book_synced_at[symbol] = clock.now()
                 logger.info(f"{symbol} order book synced. LastUpdateId: {data['lastUpdateId']}")
         except aiohttp.ClientError as e:
             logger.error(f"Failed to fetch {symbol} order book snapshot failed: {e}")
@@ -333,6 +338,33 @@ class BinanceCexClient(CexClient):
                 self.orderbooks[symbol]['asks'][p] = q
         
         self.last_update_ids[symbol] = final_update_id
+        self._book_synced_at[symbol] = clock.now()
+
+    async def get_book(self, pair: MarketPair) -> Optional[BookSnapshot]:
+        """Return the locally maintained depth ladder for this pair.
+
+        Sourced entirely from the WebSocket-maintained book. There is
+        deliberately no REST fallback: a REST depth call costs weight 50
+        against a 6000/minute budget, so using it on the hot path would
+        breach the limit well before the pair count became interesting.
+
+        `_book_synced_at` is stamped by the snapshot and by every applied
+        diff, so a stalled stream shows up as an ageing book rather than
+        being silently mistaken for a quiet market.
+        """
+        symbol = pair.cex_symbol.replace('/', '')
+        book = self.orderbooks.get(symbol)
+        if not book or not book['bids'] or not book['asks']:
+            return None
+
+        synced_at = self._book_synced_at.get(symbol)
+        if synced_at is None:
+            return None
+
+        # Sorted best-first: asks ascending, bids descending.
+        asks = sorted(book['asks'].items())
+        bids = sorted(book['bids'].items(), reverse=True)
+        return BookSnapshot(pair=pair, bids=bids, asks=asks, timestamp=synced_at)
 
     async def get_quote(self, pair: MarketPair) -> Optional[Quote]:
         symbol = pair.cex_symbol.replace('/', '')
@@ -378,7 +410,7 @@ class BinanceCexClient(CexClient):
             side="buy", # placeholder
             size=Decimal(0), # placeholder
             venue="CEX",
-            timestamp=asyncio.get_running_loop().time()
+            timestamp=clock.now(),
         )
 
     async def create_order(self, order: CexOrder) -> OrderUpdate:

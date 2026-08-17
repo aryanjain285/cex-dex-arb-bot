@@ -1,61 +1,66 @@
-# Trading pair configuration
+# Statically configured trading pairs.
 #
-# base:                   base currency (e.g. ETH)
-# quote:                  quote currency (e.g. USDT)
-# min_edge_bps:           minimum spread required to trigger arbitrage (basis points, 1 bps = 0.01%).
-#                         Should account for CEX/DEX fees, slippage, and gas cost.
-# max_slippage_bps:       maximum slippage tolerated
-# max_size_quote:         maximum notional value per trade, in the quote currency
-# dex_chain:              chain this pair trades on
-# dex_pool_fee:           Uniswap V3 pool fee tier (e.g. 500 = 0.05%, 3000 = 0.3%)
-# price_floor_quote:      reject quotes below this price as bad data
-# price_ceiling_quote:    reject quotes above this price as bad data
-# max_edge_bps:           reject edges above this as bad data
-# edge_safety_multiplier: multiplier applied to the computed cost floor
-# base_precision:         decimal places for order quantity, from the symbol's LOT_SIZE stepSize
-# quote_precision:        decimal places for order price, from the symbol's PRICE_FILTER tickSize
+# base:                base currency (e.g. WETH)
+# quote:               quote currency (e.g. USDT)
+# cex_symbol:          the exchange symbol, slash-separated
+# dex_chain:           chain the pool is on
+# dex_pool_fee:        Uniswap V3 fee tier (500 = 0.05%, 3000 = 0.3%)
+#
+# min_net_bps:         OPTIONAL per-pair override of strategy.min_net_bps.
+#                      Minimum NET edge required to act, after taker fee and
+#                      gas. Omit to use the global value from default.yaml.
+#
+# max_slippage_bps:    Execution slippage TOLERANCE only. It is used to derive
+#                      amountOutMinimum for the on-chain swap and is NOT a
+#                      cost -- it never enters the trade economics. Tight
+#                      values (10-30 bps) limit MEV exposure; loose values let
+#                      a swap fill far from its quote.
+#
+# price_floor_quote /  Sanity bounds. A quote outside this range is treated as
+# price_ceiling_quote: bad data and the opportunity is discarded.
+# max_edge_bps:        Sanity bound on the net edge, checked independently of
+#                      strategy.max_net_bps_sanity as defence in depth.
+#
+# base_precision:      Decimals for order quantity, from the symbol's
+#                      LOT_SIZE stepSize.
+# quote_precision:     Decimals for order price, from PRICE_FILTER tickSize.
+#                      Both are required for live orders to be accepted.
 pairs:
   - base: "WETH"
     quote: "USDT"
     cex_symbol: "ETH/USDT"
-    min_edge_bps: 3         # applies only to statically configured pairs
-    max_slippage_bps: 100   # 10 bps = 0.1%
+    max_slippage_bps: 30
     max_size_quote: 5000
     dex_chain: "ethereum"
     dex_pool_fee: 500
     price_floor_quote: 100
-    price_ceiling_quote: 10000
-    max_edge_bps: 50000
-    edge_safety_multiplier: 1.2
+    price_ceiling_quote: 100000
+    max_edge_bps: 1000
     base_precision: 4         # LOT_SIZE stepSize = 0.0001
     quote_precision: 2        # PRICE_FILTER tickSize = 0.01
 
   - base: "WETH"
     quote: "USDC"
     cex_symbol: "ETH/USDC"
-    min_edge_bps: 10
-    max_slippage_bps: 5
+    max_slippage_bps: 30
     max_size_quote: 5000
     dex_chain: "ethereum"
     dex_pool_fee: 500
     price_floor_quote: 100
-    price_ceiling_quote: 10000
-    max_edge_bps: 50000
-    edge_safety_multiplier: 1.2
+    price_ceiling_quote: 100000
+    max_edge_bps: 1000
     base_precision: 4
     quote_precision: 2
 
   - base: "ARB"
     quote: "USDT"
     cex_symbol: "ARB/USDT"
-    min_edge_bps: 15
-    max_slippage_bps: 8
+    max_slippage_bps: 30
     max_size_quote: 3000
     dex_chain: "arbitrum"
     dex_pool_fee: 3000
-    price_floor_quote: 0.1
-    price_ceiling_quote: 10
-    max_edge_bps: 50000
-    edge_safety_multiplier: 1.2
+    price_floor_quote: 0.01
+    price_ceiling_quote: 100
+    max_edge_bps: 1000
     base_precision: 1         # stepSize = 0.1
     quote_precision: 3        # tickSize = 0.001

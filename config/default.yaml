@@ -51,14 +51,44 @@ cex:
   api_secret_env: "BINANCE_API_SECRET"
   recv_window_ms: 5000
 
-# Strategy settings
+# Strategy settings.
+# Every value that affects a trading decision lives here, not as a literal in
+# the code. See src/core/config.py:StrategyConfig for validation rules.
 strategy:
-  # Target notional size in USD for each trade.
-  target_notional_usd: 10
-  # Minimum edge in basis points required to trigger a trade.
-  min_edge_bps: 5
-  # Maximum slippage in basis points allowed for a trade.
-  max_slippage_bps: 15
+  # Target notional per trade, in the quote currency.
+  target_notional_usd: 1000
+
+  # CEX taker fee in basis points. Binance spot is 10.0 standard, or 7.5 with
+  # the BNB fee-burn discount enabled. Check yours under Wallet > Fees.
+  # A wrong value here silently biases every decision, so verify it.
+  taker_fee_bps: 7.5
+
+  # The only profitability knob: minimum NET edge required to act, in basis
+  # points, after the taker fee and gas have been deducted.
+  #
+  # This replaces the old min_edge_bps + max_slippage_bps pair. Those
+  # double-counted price impact, which is already inside the DEX quote --
+  # measured against a live pool, the quoter returns a price net of both the
+  # pool fee and the impact for the requested size.
+  min_net_bps: 5
+
+  # Reject a computed net edge above this as bad data rather than trading it.
+  # Guards against decimals and units errors reaching the executor.
+  max_net_bps_sanity: 1000
+
+  # How long a detected opportunity stays actionable, in seconds.
+  opportunity_ttl_seconds: 2.0
+
+  # Idle sleep between detection cycles when nothing was found, in seconds.
+  # Interacts with the exchange weight budget -- lower means more requests.
+  loop_interval_seconds: 0.2
+
+  # TTL for the cached intermediate-asset CEX price used by synthetic pairs.
+  intermediate_price_cache_seconds: 2.0
+
+  # Reject an order book older than this, in seconds. Without it, a stalled
+  # feed is indistinguishable from a quiet market.
+  max_book_age_seconds: 5.0
 
 # CEX settings (testnet)
 # cex:

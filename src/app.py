@@ -54,13 +54,12 @@ class ArbiBotApp:
                 base_precision=p.base_precision if p.base_precision is not None else 8,
                 quote_precision=p.quote_precision if p.quote_precision is not None else 8,
                 # Copy strategy params from static config
-                min_edge_bps=p.min_edge_bps,
+                min_net_bps=p.min_net_bps,
                 max_slippage_bps=p.max_slippage_bps,
                 max_size_quote=p.max_size_quote,
                 price_floor_quote=p.price_floor_quote,
                 price_ceiling_quote=p.price_ceiling_quote,
                 max_edge_bps=p.max_edge_bps,
-                edge_safety_multiplier=p.edge_safety_multiplier,
             )
             static_pairs.append(pair)
 
@@ -169,13 +168,12 @@ class ArbiBotApp:
                     intermediate_symbol=intermediate_symbol,
                     base_precision=8,
                     quote_precision=8,
-                    min_edge_bps=default_params.get("min_edge_bps"),
+                    min_net_bps=default_params.get("min_net_bps"),
                     max_slippage_bps=default_params.get("max_slippage_bps"),
                     max_size_quote=default_params.get("max_size_quote"),
                     price_floor_quote=default_params.get("price_floor_quote"),
                     price_ceiling_quote=default_params.get("price_ceiling_quote"),
                     max_edge_bps=default_params.get("max_edge_bps"),
-                    edge_safety_multiplier=default_params.get("edge_safety_multiplier"),
                 )
                 discovered_pairs.append(pair)
             return discovered_pairs
@@ -209,7 +207,7 @@ class ArbiBotApp:
             try:
                 opportunities = await self.detector.detect()
                 if not opportunities:
-                    await asyncio.sleep(0.2) # avoid a tight spin loop
+                    await asyncio.sleep(self.config.strategy.loop_interval_seconds)
                     continue
 
                 for opp in opportunities:

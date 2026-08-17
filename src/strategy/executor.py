@@ -1,10 +1,10 @@
-import time
 from dataclasses import dataclass
-from decimal import Decimal, DivisionByZero, InvalidOperation
+from decimal import Decimal
 from typing import Dict, List, Optional, Tuple
 
 from loguru import logger
 
+from ..core import clock
 from ..core.config import PairConfig
 from ..core.types import Opportunity, ExecutionSummary, ExecutionLeg
 from ..exchange.cex_base import CexClient
@@ -83,23 +83,22 @@ def build_legs(opp: Opportunity) -> List[ExecutionLeg]:
     return [cex_leg, dex_leg]
 
 
-def compute_edge(buy_price: Decimal, sell_price: Decimal) -> Decimal:
-    if buy_price <= ZERO:
-        raise DivisionByZero("Buy price must be positive to compute an edge.")
-    return (sell_price / buy_price - Decimal(1)) * TEN_THOUSAND
-
-
-def compute_pnl(opp: Opportunity, buy_price: Decimal, sell_price: Decimal) -> Decimal:
-    gross = opp.size * (sell_price - buy_price)
-    mid_price = (sell_price + buy_price) / Decimal(2)
-    slippage_cost = (mid_price * opp.size * opp.slippage_bps) / TEN_THOUSAND
-    return gross - opp.cex_fee_quote - slippage_cost - opp.gas_cost_quote
-
-
 def evaluate_opportunity(
     opp: Opportunity,
     thresholds: SanityThresholds,
 ) -> Tuple[List[ExecutionLeg], Optional[Decimal], Optional[Decimal], Optional[str]]:
+    """Gate an opportunity and normalise it into legs.
+
+    This deliberately does NOT recompute the trade economics. The detector
+    owns them: it priced both venues with depth-weighted quotes and summed
+    every cost exactly once in `costs.evaluate_trade`. An executor that
+    re-derived PnL previously reapplied a slippage deduction for impact that
+    the DEX quote already included, so the two components of the pipeline
+    disagreed about the value of the same trade.
+
+    What remains here is an independent sanity gate -- defence in depth
+    against a bad price or a units error reaching execution.
+    """
     buy_price, sell_price = determine_leg_prices(opp)
 
     if opp.cex_price <= ZERO:
@@ -117,17 +116,16 @@ def evaluate_opportunity(
     if sell_price <= ZERO:
         return [], None, None, "sell_price_non_positive"
 
-    try:
-        edge_bps = compute_edge(buy_price, sell_price)
-    except (DivisionByZero, InvalidOperation):
-        return [], None, None, "edge_computation_error"
+    if opp.size <= ZERO:
+        return [], None, None, "size_non_positive"
 
+    # The detector's net edge, re-checked against this pair's own ceiling.
+    edge_bps = opp.edge_bps
     if abs(edge_bps) > thresholds.max_edge_bps:
         return [], None, edge_bps, "edge_beyond_threshold"
 
-    pnl_quote = compute_pnl(opp, buy_price, sell_price)
     legs = build_legs(opp)
-    return legs, pnl_quote, edge_bps, None
+    return legs, opp.expected_pnl_quote, edge_bps, None
 
 
 class TransactionExecutor:
@@ -141,7 +139,8 @@ class TransactionExecutor:
     `ExecutionLeg.price_quote` is always a quote-per-base price and
     `ExecutionLeg.size` is always a base quantity.
 
-    PnL is `size * (sell_px - buy_px) - cex_fee_quote - slippage_cost_quote - gas_cost_quote`.
+    PnL and edge are taken from the Opportunity, not recomputed here --
+    `costs.evaluate_trade` is the single place costs are summed.
 
     Configurable price and edge sanity checks are applied so that anomalous
     market data cannot pollute the calculation.
@@ -165,7 +164,7 @@ class TransactionExecutor:
 
     async def run(self, opp: Opportunity) -> ExecutionSummary:
         """Compute legs, PnL, and edge for the supplied `Opportunity`."""
-        start_ts = time.time()
+        start_ts = clock.now()
         thresholds = self._thresholds.get(opp.pair.cex_symbol, DEFAULT_SANITY_THRESHOLDS)
 
         legs, pnl_quote, edge_bps, error = evaluate_opportunity(opp, thresholds)
@@ -193,7 +192,7 @@ class TransactionExecutor:
             edge_bps=edge_bps,
             hedged=False,
             started_ts=start_ts,
-            completed_ts=time.time(),
+            completed_ts=clock.now(),
         )
 
         metrics.trades_executed.labels(
@@ -215,7 +214,7 @@ class TransactionExecutor:
             edge_bps=ZERO,
             hedged=False,
             started_ts=start_ts,
-            completed_ts=time.time(),
+            completed_ts=clock.now(),
         )
 
 
@@ -232,7 +231,7 @@ class PaperExecutor:
         self._thresholds = build_threshold_map(pair_configs)
 
     async def run(self, opp: Opportunity) -> ExecutionSummary:
-        start_ts = time.time()
+        start_ts = clock.now()
         thresholds = self._thresholds.get(opp.pair.cex_symbol, DEFAULT_SANITY_THRESHOLDS)
 
         legs, pnl_quote, edge_bps, error = evaluate_opportunity(opp, thresholds)
@@ -260,7 +259,7 @@ class PaperExecutor:
             edge_bps=edge_bps,
             hedged=False,
             started_ts=start_ts,
-            completed_ts=time.time(),
+            completed_ts=clock.now(),
         )
 
     def _build_invalid_summary(self, opp: Opportunity, start_ts: float) -> ExecutionSummary:
@@ -274,5 +273,5 @@ class PaperExecutor:
             edge_bps=ZERO,
             hedged=False,
             started_ts=start_ts,
-            completed_ts=time.time(),
+            completed_ts=clock.now(),
         )

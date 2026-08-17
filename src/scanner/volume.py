@@ -290,7 +290,7 @@ class VolumeScannerService:
                     "base": base,
                     "quote": quote,
                     "cex_symbol": anomaly.symbol.cex_symbol,
-                    "min_edge_bps": self.volume_cfg.default_pair_params.get("min_edge_bps", 10),
+                    "min_net_bps": self.volume_cfg.default_pair_params.get("min_net_bps"),
                     "max_slippage_bps": self.volume_cfg.default_pair_params.get("max_slippage_bps", 50),
                     "max_size_quote": self.volume_cfg.default_pair_params.get("max_size_quote", 1000),
                     "dex_chain": chain,
@@ -298,7 +298,6 @@ class VolumeScannerService:
                     "price_floor_quote": self.volume_cfg.default_pair_params.get("price_floor_quote"),
                     "price_ceiling_quote": self.volume_cfg.default_pair_params.get("price_ceiling_quote"),
                     "max_edge_bps": self.volume_cfg.default_pair_params.get("max_edge_bps"),
-                    "edge_safety_multiplier": self.volume_cfg.default_pair_params.get("edge_safety_multiplier"),
                     "base_precision": anomaly.symbol.base_precision,
                     "quote_precision": anomaly.symbol.quote_precision,
                 }

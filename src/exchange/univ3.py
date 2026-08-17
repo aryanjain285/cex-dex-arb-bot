@@ -11,7 +11,9 @@ from web3.middleware import ExtraDataToPOAMiddleware
 from web3.contract import Contract
 from loguru import logger
 
+from ..core import clock
 from ..core.config import DexConfig, NetworkConfig, SecretsConfig, TokenDetails
+from .price_oracle import NativePriceOracle
 from ..core.types import MarketPair, DexQuote, DexSwapParams, DexTxReceipt
 from .dex_base import DexClient
 
@@ -51,6 +53,12 @@ class UniV3DexClient(DexClient):
             self.factory_abi = None
             logger.debug("Uniswap V3 factory ABI not loaded; some features will be unavailable.")
         self._factory_contracts: Dict[str, 'Contract'] = {}
+        # Native-token USD price, cached with an explicit staleness contract.
+        # Fails closed: if gas cannot be priced, the quote is declined.
+        self.price_oracle = NativePriceOracle(
+            ttl_seconds=dex_config.native_price_ttl_seconds,
+            stale_grace_seconds=dex_config.native_price_stale_grace_seconds,
+        )
         logger.info(f"UniV3DexClient initialised, address: {self.user_address}, supported chains: {list(self.w3_instances.keys())}")
 
     def _to_atomic(self, amount: Decimal, decimals: int) -> int:
@@ -215,12 +223,20 @@ class UniV3DexClient(DexClient):
             gas_cost_quote = ZERO_DEC
 
             if estimate_gas:
-                gas_estimate = 200_000  # rough estimate
                 gas_price_wei = await asyncio.to_thread(lambda: w3.eth.gas_price)
-                # the cost is denominated in the native token (e.g. ETH); expressed here in USD
-                native_token_price_usd = await self._get_native_token_price_usd(pair.dex_chain)
-                gas_cost_native = w3.from_wei(gas_estimate * gas_price_wei, 'ether')
-                gas_cost_quote = Decimal(str(gas_cost_native)) * Decimal(str(native_token_price_usd))
+                priced = await self._gas_cost_in_quote(
+                    oracle=self.price_oracle,
+                    chain=pair.dex_chain,
+                    gas_units=self.dex_config.swap_gas_estimate_units,
+                    gas_price_wei=int(gas_price_wei),
+                )
+                if priced is None:
+                    logger.warning(
+                        f"Declining to quote {pair.cex_symbol} on {pair.dex_chain}: "
+                        f"gas cannot be priced, so the economics are not trustworthy."
+                    )
+                    return None
+                gas_cost_quote = priced
 
             return DexQuote(price=price, gas_cost_quote=gas_cost_quote)
 
@@ -228,19 +244,25 @@ class UniV3DexClient(DexClient):
             logger.warning(f"Error fetching a quote from QuoterV2 ({pair.cex_symbol} on {pair.dex_chain}): {e}")
             return None
 
-    async def _get_native_token_price_usd(self, chain: str) -> Decimal:
-        try:
-            if chain in ['ethereum', 'arbitrum', 'base']:
-                async with aiohttp.ClientSession() as session:
-                    async with session.get(
-                        "https://api.coingecko.com/api/v3/simple/price?ids=ethereum&vs_currencies=usd",
-                        timeout=8
-                    ) as response:
-                        data = await response.json()
-                        return Decimal(str(data['ethereum']['usd']))
-        except Exception as _:
-            pass
-        return Decimal("3000")
+    @staticmethod
+    async def _gas_cost_in_quote(
+        *,
+        oracle: NativePriceOracle,
+        chain: str,
+        gas_units: int,
+        gas_price_wei: int,
+    ) -> Optional[Decimal]:
+        """Convert a gas cost into the quote currency, or None if unpriceable.
+
+        Returning None is the important behaviour. A guessed native price
+        silently rescales every gas cost and therefore silently shifts every
+        profitability decision, with nothing raised and nothing logged.
+        """
+        native_price = await oracle.get_usd_price(chain)
+        if native_price is None:
+            return None
+        gas_cost_native = Decimal(gas_units) * Decimal(gas_price_wei) / Decimal(10 ** 18)
+        return gas_cost_native * native_price
 
     async def _approve_token(self, w3: Web3, token_address: str, router_address: str, required_amount: int):
         token_contract = w3.eth.contract(address=token_address, abi=self.erc20_abi)
@@ -298,7 +320,7 @@ class UniV3DexClient(DexClient):
             'tokenOut': token_out_addr,
             'fee': params.fee,
             'recipient': self.user_address,
-            'deadline': int(time.time()) + 600,
+            'deadline': int(clock.now()) + self.dex_config.swap_deadline_seconds,
             'amountIn': amount_in_wei,
             'amountOutMinimum': amount_out_minimum,
             'sqrtPriceLimitX96': 0

@@ -1,171 +1,139 @@
-import asyncio
-import pytest
+"""Direction selection and threshold behaviour.
+
+Rewritten for the net-economics detector. The previous version of this file
+mocked `get_quote` and asserted against the old pre-fee-edge-versus-assembled-
+threshold model; after the rewrite two of its tests passed only because every
+pair raised a TypeError and returned zero opportunities, which is a false
+pass. These exercise the real decision path instead.
+"""
 from decimal import Decimal
-from unittest.mock import AsyncMock, MagicMock
 
-from src.core.types import MarketPair, CexQuote
-from src.core.config import PairConfig, StrategyConfig
+import pytest
+
+from src.core.config import StrategyConfig
 from src.strategy.detector import OpportunityDetector
+from tests.fakes import D, FakeCex, FakeDex, flat_book, make_pair
 
-# mock pair configuration
-@pytest.fixture
-def mock_pair_config() -> PairConfig:
-    return PairConfig(
-        base="WETH",
-        quote="USDT",
-        cex_symbol="ETH/USDT",
-        min_edge_bps=10,
-        max_slippage_bps=5,
-        max_size_quote=5000,
-        dex_chain="ethereum",
-        dex_pool_fee=500,
-        edge_safety_multiplier=Decimal("1.2"),
-        base_precision=4,
-        quote_precision=2,
+
+def strategy(**overrides) -> StrategyConfig:
+    defaults = dict(
+        target_notional_usd=1000, taker_fee_bps=D("7.5"), min_net_bps=D(5)
     )
-
-# mock MarketPair
-@pytest.fixture
-def market_pair() -> MarketPair:
-    return MarketPair(
-        base="WETH",
-        quote_cex="USDT",
-        quote_dex="USDT",
-        cex_symbol="ETH/USDT",
-        dex_chain="ethereum",
-        dex_pool_fee=500,
-        base_precision=4,
-        quote_precision=2,
-    )
-
-# mock StrategyConfig
-@pytest.fixture
-def mock_strategy_config() -> StrategyConfig:
-    return StrategyConfig(target_notional_usd=10, min_edge_bps=5, max_slippage_bps=15)
-
-# mock CEX and DEX clients
-@pytest.fixture
-def mock_clients():
-    cex_client = AsyncMock()
-    dex_client = AsyncMock()
-    return cex_client, dex_client
-
-def test_no_opportunity(mock_clients, mock_strategy_config, market_pair):
-    """No arbitrage opportunity available."""
-    cex_client, dex_client = mock_clients
-
-    # set the CEX quote
-    cex_client.get_quote.return_value = CexQuote(
-        bid_price=Decimal("2999.5"), ask_price=Decimal("3000.5"), ts=0
-    )
-    # set the DEX quote
-    async def dex_quote_side_effect(pair, size, side, estimate_gas):
-        if side == "buy": # DEX ask
-            return MagicMock(price=Decimal("3001"), gas_cost_quote=Decimal("0.01"))
-        else: # DEX bid
-            return MagicMock(price=Decimal("2999"), gas_cost_quote=Decimal("0.01"))
-    dex_client.get_quote.side_effect = dex_quote_side_effect
-
-    detector = OpportunityDetector(mock_strategy_config, cex_client, dex_client, [market_pair])
-    opportunities = asyncio.run(detector.detect())
-
-    assert len(opportunities) == 0
-
-def test_cex_to_dex_opportunity(mock_clients, mock_strategy_config, market_pair):
-    """Buy on the CEX, sell on the DEX."""
-    cex_client, dex_client = mock_clients
-
-    # CEX cheap, DEX expensive.
-    # The detector's bar is dynamic: (taker_fee + slippage + gas_bps) * safety.
-    # At a $10 target notional a $0.01 gas cost is ~10 bps, so the effective
-    # threshold here is (7.5 + 10 + 10) * 1.2 = 33 bps. The DEX sell price
-    # below clears that with room to spare.
-    cex_client.get_quote.return_value = CexQuote(
-        bid_price=Decimal("2999.5"), ask_price=Decimal("3000.5"), ts=0
-    )
-    async def dex_quote_side_effect(pair, size, side, estimate_gas):
-        if side == "buy":
-            return MagicMock(price=Decimal("3019"), gas_cost_quote=Decimal("0.01"))
-        else:
-            return MagicMock(price=Decimal("3020"), gas_cost_quote=Decimal("0.01"))
-    dex_client.get_quote.side_effect = dex_quote_side_effect
-
-    detector = OpportunityDetector(mock_strategy_config, cex_client, dex_client, [market_pair])
-    opportunities = asyncio.run(detector.detect())
-
-    assert len(opportunities) == 1
-    opp = opportunities[0]
-    assert opp.direction == "CEX_to_DEX"
-    assert opp.cex_price == Decimal("3000.5") # CEX ask price
-    assert opp.dex_price == Decimal("3020")   # DEX bid price
-    assert opp.edge_bps > Decimal("33")       # cleared the dynamic threshold
+    defaults.update(overrides)
+    return StrategyConfig(**defaults)
 
 
-def test_dex_to_cex_opportunity(mock_clients, mock_strategy_config, market_pair):
-    """Buy on the DEX, sell on the CEX."""
-    cex_client, dex_client = mock_clients
-
-    # DEX cheap, CEX expensive. Same ~33 bps dynamic threshold as above;
-    # the DEX buy price is set low enough to clear it.
-    cex_client.get_quote.return_value = CexQuote(
-        bid_price=Decimal("3009.5"), ask_price=Decimal("3010.5"), ts=0
-    )
-    async def dex_quote_side_effect(pair, size, side, estimate_gas):
-        if side == "buy":
-            return MagicMock(price=Decimal("2990"), gas_cost_quote=Decimal("0.01"))
-        else:
-            return MagicMock(price=Decimal("2989"), gas_cost_quote=Decimal("0.01"))
-    dex_client.get_quote.side_effect = dex_quote_side_effect
-
-    detector = OpportunityDetector(mock_strategy_config, cex_client, dex_client, [market_pair])
-    opportunities = asyncio.run(detector.detect())
-
-    assert len(opportunities) == 1
-    opp = opportunities[0]
-    assert opp.direction == "DEX_to_CEX"
-    assert opp.cex_price == Decimal("3009.5") # CEX bid price
-    assert opp.dex_price == Decimal("2990")   # DEX ask price
-    assert opp.edge_bps > Decimal("33")       # cleared the dynamic threshold
+def detector(cex, dex, pairs, **cfg) -> OpportunityDetector:
+    return OpportunityDetector(strategy(**cfg), cex, dex, pairs)
 
 
-def test_opportunity_below_threshold(mock_clients, mock_strategy_config, market_pair):
-    """Spread exists but is below the minimum threshold."""
-    cex_client, dex_client = mock_clients
+async def test_no_opportunity_when_the_spread_is_inside_costs():
+    """A 2 bps gross spread cannot survive a 7.5 bps taker fee."""
+    pair = make_pair()
+    cex = FakeCex({"ETH/USDT": flat_book(bid=1000, ask=1000)})
+    dex = FakeDex(sell_price=1000.2, buy_price=1000.2)
 
-    # a spread exists, but it is small
-    cex_client.get_quote.return_value = CexQuote(
-        bid_price=Decimal("2999.9"), ask_price=Decimal("3000.1"), ts=0
-    )
-    async def dex_quote_side_effect(pair, size, side, estimate_gas):
-        if side == "buy":
-            return MagicMock(price=Decimal("3000.2"), gas_cost_quote=Decimal("0.01"))
-        else:
-            return MagicMock(price=Decimal("3000"), gas_cost_quote=Decimal("0.01"))
-    dex_client.get_quote.side_effect = dex_quote_side_effect
-
-    detector = OpportunityDetector(mock_strategy_config, cex_client, dex_client, [market_pair])
-    opportunities = asyncio.run(detector.detect())
-
-    assert len(opportunities) == 0
+    assert not await detector(cex, dex, [pair]).detect()
 
 
-def test_opportunity_filtered_by_dynamic_threshold(mock_clients, mock_strategy_config, market_pair):
-    """An edge between the static and dynamic thresholds should be filtered out."""
-    cex_client, dex_client = mock_clients
+async def test_cex_to_dex_is_selected_when_the_dex_is_expensive():
+    pair = make_pair()
+    cex = FakeCex({"ETH/USDT": flat_book(bid=1000, ask=1000)})
+    dex = FakeDex(sell_price=1050, buy_price=1050)
 
-    cex_client.get_quote.return_value = CexQuote(
-        bid_price=Decimal("2999.5"), ask_price=Decimal("3000.5"), ts=0
-    )
+    opps = await detector(cex, dex, [pair]).detect()
 
-    async def dex_quote_side_effect(pair, size, side, estimate_gas):
-        if side == "buy":
-            return MagicMock(price=Decimal("3001.0"), gas_cost_quote=Decimal("0.01"))
-        else:
-            return MagicMock(price=Decimal("3003.1"), gas_cost_quote=Decimal("0.01"))
+    assert len(opps) == 1
+    assert opps[0].direction == "CEX_to_DEX"
+    assert opps[0].cex_price == D(1000)   # bought on the CEX
+    assert opps[0].dex_price == D(1050)   # sold on the DEX
 
-    dex_client.get_quote.side_effect = dex_quote_side_effect
 
-    detector = OpportunityDetector(mock_strategy_config, cex_client, dex_client, [market_pair])
-    opportunities = asyncio.run(detector.detect())
+async def test_dex_to_cex_is_selected_when_the_dex_is_cheap():
+    pair = make_pair()
+    cex = FakeCex({"ETH/USDT": flat_book(bid=1000, ask=1000)})
+    dex = FakeDex(sell_price=950, buy_price=950)
 
-    assert len(opportunities) == 0
+    opps = await detector(cex, dex, [pair]).detect()
+
+    assert len(opps) == 1
+    assert opps[0].direction == "DEX_to_CEX"
+    assert opps[0].dex_price == D(950)    # bought on the DEX
+    assert opps[0].cex_price == D(1000)   # sold on the CEX
+
+
+async def test_the_more_profitable_direction_wins_when_both_qualify():
+    """Both directions are always evaluated; the better net must be chosen."""
+    pair = make_pair()
+    # ask 1000 / bid 1200: buying at 1000 to sell at 1100 beats
+    # buying at 1100 to sell at 1200 only if net is compared, not gross.
+    cex = FakeCex({"ETH/USDT": ([(D(1200), D(10_000))], [(D(1000), D(10_000))])})
+    dex = FakeDex(sell_price=1100, buy_price=1100)
+
+    opps = await detector(cex, dex, [pair]).detect()
+
+    assert len(opps) == 1
+    # CEX_to_DEX gross = 100/unit; DEX_to_CEX gross = 100/unit, but the CEX
+    # fee differs by leg price, so exactly one is strictly better.
+    assert opps[0].expected_pnl_quote > 0
+
+
+async def test_reported_edge_is_net_of_fees_not_gross():
+    """edge_bps must be the net figure the decision was made on.
+
+    Gross here is 100 bps; the taker fee removes 7.5, so a gross-reporting
+    detector would show ~100 and a net-reporting one ~92.5.
+    """
+    pair = make_pair()
+    cex = FakeCex({"ETH/USDT": flat_book(bid=1000, ask=1000)})
+    dex = FakeDex(sell_price=1010, buy_price=1010)
+
+    opps = await detector(cex, dex, [pair]).detect()
+
+    assert len(opps) == 1
+    assert opps[0].edge_bps == D("92.5")
+
+
+async def test_per_pair_min_net_bps_overrides_the_global_floor():
+    lax = make_pair(symbol="LAX/USDT", base="LAX", min_net_bps=D(1))
+    strict = make_pair(symbol="STR/USDT", base="STR", min_net_bps=D(500))
+    cex = FakeCex({
+        "LAX/USDT": flat_book(bid=1000, ask=1000),
+        "STR/USDT": flat_book(bid=1000, ask=1000),
+    })
+    dex = FakeDex(sell_price=1010, buy_price=1010)
+
+    opps = await detector(cex, dex, [lax, strict], min_net_bps=D(5)).detect()
+
+    symbols = {o.pair.cex_symbol for o in opps}
+    assert symbols == {"LAX/USDT"}
+
+
+async def test_absurd_edge_is_rejected_as_bad_data():
+    """A units or decimals error must not be actioned as an opportunity."""
+    pair = make_pair()
+    cex = FakeCex({"ETH/USDT": flat_book(bid=1000, ask=1000)})
+    dex = FakeDex(sell_price=10_000_000, buy_price=10_000_000)
+
+    opps = await detector(cex, dex, [pair], max_net_bps_sanity=D(1000)).detect()
+
+    assert not opps
+
+
+async def test_dex_buy_leg_is_quoted_in_quote_currency_not_base():
+    """Regression guard for the buy-leg unit bug.
+
+    `get_quote(side="buy")` consumes an amount of the DEX quote token. The
+    detector previously passed a base amount, understating slippage by a
+    factor of the price and inflating the DEX_to_CEX edge.
+    """
+    pair = make_pair()
+    cex = FakeCex({"ETH/USDT": flat_book(bid=1000, ask=1000)})
+    dex = FakeDex(sell_price=950, buy_price=950)
+
+    await detector(cex, dex, [pair]).detect()
+
+    buys = [size for side, size in dex.requests if side == "buy"]
+    assert buys, "the buy side should have been quoted"
+    # target notional is 1000 quote; a base amount would be ~1
+    assert buys[0] == D(1000)
