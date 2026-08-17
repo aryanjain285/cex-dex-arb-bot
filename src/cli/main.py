@@ -11,7 +11,7 @@ except ImportError:  # uvloop does not support Windows
 def install_event_loop_policy() -> None:
     """Install uvloop when available; a no-op on platforms without it."""
     if uvloop is not None:
-        install_event_loop_policy()
+        uvloop.install()
 
 from src.app import ArbiBotApp
 from src.core.config import load_config, TokenDetails
