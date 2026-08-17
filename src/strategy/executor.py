@@ -83,9 +83,35 @@ def build_legs(opp: Opportunity) -> List[ExecutionLeg]:
     return [cex_leg, dex_leg]
 
 
+def _count_rejection(opp: Opportunity, reason: str) -> None:
+    """Record a refusal, in both executors, without ever raising.
+
+    Telemetry must not be able to change what the executor returns -- a
+    Counter.inc() that raised inside executor.run() previously discarded a
+    trade's loss before the risk manager could see it.
+
+    `status="invalid"` on trades_executed is kept alongside the new series so
+    existing dashboards and alerts do not silently lose their signal.
+    """
+    try:
+        metrics.opportunities_rejected_total.labels(
+            pair=opp.pair.cex_symbol,
+            direction=opp.direction,
+            reason=reason,
+        ).inc()
+        metrics.trades_executed.labels(
+            pair=opp.pair.cex_symbol,
+            direction=opp.direction,
+            status="invalid",
+        ).inc()
+    except Exception as exc:  # pragma: no cover - telemetry is never fatal
+        logger.error(f"Failed to count an execution rejection: {exc}")
+
+
 def evaluate_opportunity(
     opp: Opportunity,
     thresholds: SanityThresholds,
+    now: Optional[float] = None,
 ) -> Tuple[List[ExecutionLeg], Optional[Decimal], Optional[Decimal], Optional[str]]:
     """Gate an opportunity and normalise it into legs.
 
@@ -98,7 +124,22 @@ def evaluate_opportunity(
 
     What remains here is an independent sanity gate -- defence in depth
     against a bad price or a units error reaching execution.
+
+    `now` is injectable so the deadline can be tested exactly rather than raced
+    against the wall clock.
     """
+    # Checked first, and before any price gate. An opportunity is a claim about
+    # two prices at one instant; past its deadline it is not a worse opportunity
+    # but a statement about a market that no longer exists. Reporting staleness
+    # rather than the resulting price anomaly also points at the real cause,
+    # which is latency.
+    #
+    # `valid_until` was previously written by the detector on every opportunity
+    # and read nowhere, so the TTL was decorative.
+    now = clock.now() if now is None else now
+    if now >= opp.valid_until:
+        return [], None, None, "opportunity_expired"
+
     buy_price, sell_price = determine_leg_prices(opp)
 
     if opp.cex_price <= ZERO:
@@ -175,11 +216,7 @@ class TransactionExecutor:
                 opp.direction,
                 error,
             )
-            metrics.trades_executed.labels(
-                pair=opp.pair.cex_symbol,
-                direction=opp.direction,
-                status="invalid",
-            ).inc()
+            _count_rejection(opp, error)
             return self._build_invalid_summary(opp, start_ts)
 
         summary = ExecutionSummary(
@@ -246,6 +283,7 @@ class PaperExecutor:
             logger.warning(
                 f"[PAPER MODE] Opportunity failed sanity check: pair={opp.pair.cex_symbol} direction={opp.direction} reason={error}"
             )
+            _count_rejection(opp, error)
             return self._build_invalid_summary(opp, start_ts)
 
         logger.info(

@@ -33,6 +33,21 @@ trades_executed = Counter(
     ["pair", "direction", "status"]
 )
 
+# Refusals at the execution gate, split by cause. `trades_executed{status=
+# "invalid"}` lumped every refusal together, so "the price was out of range" and
+# "we were too slow" were the same number.
+#
+# The expiry rate is the single most operationally important number for a
+# latency-sensitive strategy: it separates edge lost to the market from edge lost
+# to the plumbing. Emitted by the paper executor as well, which previously
+# emitted nothing at all -- so the measurement run produced no telemetry about
+# what it was discarding.
+opportunities_rejected_total = Counter(
+    "arb_opportunities_rejected_total",
+    "Opportunities refused at the execution gate, by reason",
+    ["pair", "direction", "reason"]
+)
+
 # --- profit and loss ---
 
 # A Gauge, deliberately not a Counter. Counter.inc() raises ValueError on a

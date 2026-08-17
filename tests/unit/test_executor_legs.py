@@ -13,6 +13,7 @@ import asyncio
 import pytest
 from loguru import logger
 
+from src.core import clock
 from src.core.config import PairConfig
 from src.core.types import MarketPair, Opportunity
 from src.strategy.costs import evaluate_trade
@@ -89,7 +90,11 @@ def make_opportunity(
         gas_cost_quote=gas_cost,
         cex_fee_quote=econ.cex_fee_quote,
         expected_pnl_quote=econ.net_quote,
-        valid_until=0.0,
+        # A live deadline. This was 0.0 while `valid_until` was written by the
+        # detector and read by nobody -- which is precisely the hazard of an
+        # unenforced field: no fixture author ever had to think about it. The
+        # deadline itself is covered by test_opportunity_expiry.py.
+        valid_until=clock.now() + 60.0,
     )
 
 

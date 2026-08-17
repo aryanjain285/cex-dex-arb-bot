@@ -21,6 +21,7 @@ from decimal import Decimal
 
 import pytest
 
+from src.core import clock
 from src.core.config import PairConfig, RiskConfig
 from src.core.types import ExecutionLeg, ExecutionSummary, MarketPair, Opportunity
 from src.risk.limits import RiskManager
@@ -57,7 +58,10 @@ def losing_opportunity(market_pair) -> Opportunity:
         dex_chain="ethereum", dex_pool_fee=500,
         edge_bps=D("-50"), slippage_bps=D(30),
         gas_cost_quote=D("0.02"), cex_fee_quote=D("0.75"),
-        expected_pnl_quote=D("-5.77"), valid_until=0.0,
+        expected_pnl_quote=D("-5.77"),
+        # Live deadline: the execution gate now enforces valid_until, and a
+        # losing-but-current trade is exactly what this test is about.
+        valid_until=clock.now() + 60.0,
     )
 
 
