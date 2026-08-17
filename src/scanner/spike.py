@@ -15,6 +15,7 @@ from loguru import logger
 from src.core.config import AppConfig, VolumeSpikeConfig
 from src.core.types import MarketPair
 from src.exchange.univ3 import UniV3DexClient
+from src.strategy.costs import evaluate_trade
 
 
 @dataclass
@@ -220,25 +221,47 @@ class VolumeSpikeScanner:
 
 @dataclass
 class ArbitrageSignal:
+    """One screen hit.
+
+    `gross_bps` is the raw venue-to-venue spread; `net_bps` is what remains after
+    the taker fee and gas, computed by `costs.evaluate_trade` -- the same function
+    the detector uses, so the two numbers are comparable. The previous version
+    reported the raw spread minus a `cost_buffer_bps` fudge, which was a second
+    and wrong cost model living beside the real one.
+
+    `depth_aware` is always False and is recorded rather than assumed: the screen
+    prices from a single ticker and a single probe size, so it cannot see the
+    order book and therefore overstates achievable edge on any real size. A
+    screen hit is a reason to look, not a tradeable opportunity.
+    """
+
     symbol: str
     direction: str
-    edge_bps: float
-    effective_edge_bps: float
+    gross_bps: float
+    net_bps: float
     cex_price: float
     dex_price: float
     dex_chain: str
     dex_fee_tier: int
+    probe_size_base: float
+    gas_quote: float
+    taker_fee_bps: float
+    depth_aware: bool = False
 
     def as_dict(self) -> Dict[str, object]:
         return {
             "symbol": self.symbol,
             "direction": self.direction,
-            "edge_bps": round(self.edge_bps, 2),
-            "effective_edge_bps": round(self.effective_edge_bps, 2),
+            "gross_bps": round(self.gross_bps, 2),
+            "net_bps": round(self.net_bps, 2),
             "cex_price": self.cex_price,
             "dex_price": float(self.dex_price),
             "dex_chain": self.dex_chain,
             "dex_fee_tier": self.dex_fee_tier,
+            "probe_size_base": self.probe_size_base,
+            "gas_quote": self.gas_quote,
+            "taker_fee_bps": self.taker_fee_bps,
+            "depth_aware": self.depth_aware,
         }
 
 
@@ -247,6 +270,24 @@ class SpikeArbitrageEvaluator:
         self.config = config
         self.spike_cfg = config.scanner.spike
         self.store = VolumeSpikeStore(Path(self.spike_cfg.persist_path))
+        # Built once: a validation error belongs at construction, not in a loop
+        # over candidates where the only safe response is to keep going.
+        self._token_policy = config.strategy.token_policy.build()
+
+        # The screen reports against the SAME floor the strategy trades at unless
+        # told otherwise, so a hit means "the detector would consider this"
+        # rather than "this cleared a threshold nothing else in the system uses".
+        configured = self.spike_cfg.arbitrage.edge_threshold_bps
+        self._floor_bps = (
+            config.strategy.min_net_bps if configured is None
+            else Decimal(str(configured))
+        )
+        if self._floor_bps > config.strategy.min_net_bps:
+            logger.warning(
+                f"The spike screen floor ({self._floor_bps} bps) is above the "
+                f"strategy's own floor ({config.strategy.min_net_bps} bps), so "
+                f"the screen will hide candidates the strategy would take."
+            )
 
     async def evaluate(self, spikes: Optional[List[VolumeSpike]] = None) -> List[ArbitrageSignal]:
         if spikes is None:
@@ -281,6 +322,14 @@ class SpikeArbitrageEvaluator:
         dex_client: UniV3DexClient,
         spike: VolumeSpike,
     ) -> Optional[ArbitrageSignal]:
+        # The token gate first: a screen exists to direct human attention, and
+        # attention spent on a token that can never be traded is wasted. It also
+        # saves a ticker request and a pool lookup per candidate.
+        verdict = self._token_policy.check(spike.base, spike.quote)
+        if not verdict.allowed:
+            logger.debug(f"Skipping {spike.symbol}: {verdict.reason}")
+            return None
+
         cex_price = await client.fetch_ticker_price(spike.symbol)
         if not cex_price:
             return None
@@ -289,6 +338,7 @@ class SpikeArbitrageEvaluator:
         probe_size = Decimal(str(arbitrage_cfg.probe_size_base))
 
         dex_price: Optional[Decimal] = None
+        gas_quote: Decimal = Decimal("0")
         selected_chain: Optional[str] = None
         selected_fee: Optional[int] = None
 
@@ -301,19 +351,30 @@ class SpikeArbitrageEvaluator:
                 pool_addr = await dex_client.get_pool_address(spike.base, spike.quote, chain, fee)
                 if not pool_addr:
                     continue
+                # MarketPair's fields are quote_cex/quote_dex/cex_symbol. This
+                # previously passed `quote=` and `symbol=`, so pydantic raised on
+                # the first pool the screen found and the entire scan died -- a
+                # failure indistinguishable from "no opportunities".
                 pair = MarketPair(
                     base=spike.base,
-                    quote=spike.quote,
-                    symbol=f"{spike.base}/{spike.quote}",
+                    quote_cex=spike.quote,
+                    quote_dex=spike.quote,
+                    cex_symbol=spike.symbol,
                     dex_chain=chain,
                     dex_pool_fee=fee,
                     base_precision=spike.base_precision,
                     quote_precision=spike.quote_precision,
                 )
-                quote = await dex_client.get_quote(pair, probe_size, side="sell")
+                # estimate_gas=True because gas is a real cost of the trade and
+                # the screen's whole purpose is to say whether the spread covers
+                # its costs.
+                quote = await dex_client.get_quote(
+                    pair, probe_size, side="sell", estimate_gas=True
+                )
                 if quote is None or quote.price <= 0:
                     continue
                 dex_price = quote.price
+                gas_quote = quote.gas_cost_quote
                 selected_chain = chain
                 selected_fee = fee
                 break
@@ -329,30 +390,42 @@ class SpikeArbitrageEvaluator:
         if spread == 0:
             return None
 
-        if spread > 0:
-            direction = "DEX_to_CEX"
-            edge_reference = dex_price
-        else:
-            direction = "CEX_to_DEX"
-            edge_reference = cex_price_dec
+        # Sell wherever the price is higher.
+        direction = "DEX_to_CEX" if spread > 0 else "CEX_to_DEX"
 
-        if edge_reference <= 0:
+        # Priced through the shared cost model rather than the raw spread minus a
+        # buffer. `cost_buffer_bps` was a fudge standing in for the taker fee and
+        # gas, which are both known exactly -- and a screen whose arithmetic
+        # disagrees with the detector's is worse than no screen, because someone
+        # will eventually trust it over the real model.
+        econ = evaluate_trade(
+            direction=direction,
+            size_base=probe_size,
+            cex_price=cex_price_dec,
+            dex_price=dex_price,
+            taker_fee_bps=self.config.strategy.taker_fee_bps,
+            gas_quote=gas_quote,
+        )
+        if econ is None:
             return None
 
-        edge_bps = abs(spread) / edge_reference * Decimal("10000")
-        effective_edge = edge_bps - Decimal(str(arbitrage_cfg.cost_buffer_bps))
-        if effective_edge <= Decimal(str(arbitrage_cfg.edge_threshold_bps)):
+        gross_bps = abs(spread) / min(cex_price_dec, dex_price) * Decimal("10000")
+
+        if econ.net_bps <= self._floor_bps:
             return None
 
         signal = ArbitrageSignal(
             symbol=spike.symbol,
             direction=direction,
-            edge_bps=float(edge_bps),
-            effective_edge_bps=float(effective_edge),
+            gross_bps=float(gross_bps),
+            net_bps=float(econ.net_bps),
             cex_price=cex_price,
             dex_price=float(dex_price),
             dex_chain=selected_chain,
             dex_fee_tier=selected_fee,
+            probe_size_base=float(probe_size),
+            gas_quote=float(gas_quote),
+            taker_fee_bps=float(self.config.strategy.taker_fee_bps),
         )
         logger.debug(f"Arbitrage signal: {signal.as_dict()}")
         return signal

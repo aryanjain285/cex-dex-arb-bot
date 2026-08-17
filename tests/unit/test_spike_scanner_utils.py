@@ -41,17 +41,31 @@ def test_volume_spike_roundtrip(tmp_path: Path):
 
 
 def test_arbitrage_signal_dict_conversion():
+    """`edge_bps`/`effective_edge_bps` became `gross_bps`/`net_bps`.
+
+    The rename is not cosmetic: `effective_edge_bps` was the raw spread minus a
+    flat `cost_buffer_bps` fudge, while `net_bps` is what remains after the actual
+    taker fee and gas, computed by the same function the detector uses. The
+    signal also records the inputs (probe size, gas, fee) and that it is
+    depth-blind, so a screen hit cannot be mistaken for a tradeable edge.
+    """
     signal = ArbitrageSignal(
         symbol="ABCUSDT",
         direction="DEX_to_CEX",
-        edge_bps=120.567,
-        effective_edge_bps=100.123,
+        gross_bps=120.567,
+        net_bps=100.123,
         cex_price=1.23,
         dex_price=1.1,
         dex_chain="ethereum",
         dex_fee_tier=3000,
+        probe_size_base=1.0,
+        gas_quote=1.5,
+        taker_fee_bps=7.5,
     )
     data = signal.as_dict()
     assert data["direction"] == "DEX_to_CEX"
     assert data["dex_chain"] == "ethereum"
-    assert data["edge_bps"] == pytest.approx(120.57, abs=0.01)
+    assert data["gross_bps"] == pytest.approx(120.57, abs=0.01)
+    assert data["net_bps"] == pytest.approx(100.12, abs=0.01)
+    assert data["depth_aware"] is False
+    assert data["taker_fee_bps"] == pytest.approx(7.5)

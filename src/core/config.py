@@ -203,18 +203,26 @@ class VolumeScannerConfig(BaseModel):
 
 
 class SpikeArbitrageConfig(BaseModel):
-    edge_threshold_bps: float = 30.0
-    cost_buffer_bps: float = 15.0
+    # Minimum NET basis points -- after the taker fee and gas -- for a candidate
+    # to be reported. None means "use strategy.min_net_bps", which is the right
+    # default: a screen floor above the trading floor hides candidates the
+    # strategy would actually take, and the previous hardcoded 30.0 was 6x the
+    # 5 bps the strategy trades at. Set it explicitly only to screen deliberately
+    # more strictly than the strategy trades.
+    edge_threshold_bps: Optional[float] = None
+
+    # `cost_buffer_bps` is gone. It was a flat fudge standing in for the taker
+    # fee and gas, both of which are known exactly, and it meant the screen
+    # carried a second cost model that disagreed with the detector's. The screen
+    # now prices through costs.evaluate_trade, the single place costs are summed.
     probe_size_base: float = 1.0
     dex_chains: List[str] = Field(default_factory=lambda: ["ethereum", "arbitrum", "base"])
     dex_fee_tiers: List[int] = Field(default_factory=lambda: [500, 3000, 10000])
 
     @model_validator(mode='after')
     def validate_params(self) -> 'SpikeArbitrageConfig':
-        if self.edge_threshold_bps < 0:
+        if self.edge_threshold_bps is not None and self.edge_threshold_bps < 0:
             raise ValueError("edge_threshold_bps must not be negative")
-        if self.cost_buffer_bps < 0:
-            raise ValueError("cost_buffer_bps must not be negative")
         if self.probe_size_base <= 0:
             raise ValueError("probe_size_base must be > 0")
         if not self.dex_chains:

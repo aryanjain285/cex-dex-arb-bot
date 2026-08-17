@@ -41,33 +41,60 @@ def get_current_date_str() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
 
+_UNSET = object()
+
+
 class RiskManager:
-    def __init__(self, config: RiskConfig):
+    def __init__(self, config: RiskConfig, state_path=_UNSET):
+        """`state_path=None` keeps all state in memory and persists nothing.
+
+        The path used to be a module constant, so every RiskManager in the
+        process shared one file -- and a backtest therefore read and wrote the
+        LIVE bot's daily loss budget. Replaying a losing day consumed the live
+        allowance and could halt the live bot for a loss that happened only in a
+        simulation; replaying a winning day inflated the allowance, which is
+        worse, because the daily loss limit is the last line of defence before
+        capital is gone.
+
+        Simulations pass None. Omitting the argument keeps the shared live file,
+        so a halt still survives a restart.
+        """
         self.config = config
+        self.state_path = STATE_FILE if state_path is _UNSET else state_path
         self.positions: dict = {}
         self.daily_pnl: Decimal = ZERO
         self.halted: bool = False
         self.halt_reason: str = ""
         self._load_state()
-        logger.info(f"Risk manager initialised. PnL today: {self.daily_pnl:.4f}")
+        logger.info(
+            f"Risk manager initialised. PnL today: {self.daily_pnl:.4f} "
+            f"(state: {self.state_path if self.state_path else 'in memory only'})"
+        )
 
     # ------------------------------------------------------------------
 
     def _load_state(self) -> None:
-        if not STATE_FILE.exists():
+        if self.state_path is None:
+            # A simulation starts clean by construction. Inheriting the live
+            # day's PnL or halt would make a replay's result depend on what the
+            # live bot happened to do earlier today.
+            logger.info("Risk state is in-memory only; starting clean.")
+            return
+
+        if not self.state_path.exists():
             logger.warning("No risk state file found; starting from a clean state.")
             return
 
         try:
-            raw = STATE_FILE.read_text(encoding="utf-8")
+            raw = self.state_path.read_text(encoding="utf-8")
         except OSError as exc:
-            raise RiskStateError(f"Cannot read {STATE_FILE}: {exc}") from exc
+            raise RiskStateError(f"Cannot read {self.state_path}: {exc}") from exc
 
         try:
             state = json.loads(raw)
         except json.JSONDecodeError as exc:
             raise RiskStateError(
-                f"{STATE_FILE} is corrupt ({exc}). Refusing to start: resetting "
+                f"{self.state_path} is corrupt ({exc}). Refusing to start: resetting "
                 f"the daily loss budget on a corrupt file would defeat the loss "
                 f"limit. Inspect the file, restore it, or delete it deliberately."
             ) from exc
@@ -76,7 +103,7 @@ class RiskManager:
             stored_pnl = Decimal(str(state.get("daily_pnl", "0")))
         except (InvalidOperation, TypeError) as exc:
             raise RiskStateError(
-                f"{STATE_FILE} holds an unparseable daily_pnl "
+                f"{self.state_path} holds an unparseable daily_pnl "
                 f"({state.get('daily_pnl')!r}). Refusing to start."
             ) from exc
 
@@ -117,14 +144,19 @@ class RiskManager:
         except Exception:  # pragma: no cover - telemetry is never fatal
             pass
 
+        if self.state_path is None:
+            # Metrics above are still emitted: an in-memory run must remain
+            # observable even though it leaves nothing on disk.
+            return
+
         try:
-            STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-            tmp = STATE_FILE.with_suffix(STATE_FILE.suffix + ".tmp")
+            self.state_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self.state_path.with_suffix(self.state_path.suffix + ".tmp")
             with tmp.open("w", encoding="utf-8") as handle:
                 json.dump(payload, handle, indent=2)
                 handle.flush()
                 os.fsync(handle.fileno())
-            os.replace(tmp, STATE_FILE)
+            os.replace(tmp, self.state_path)
         except Exception as exc:
             logger.error(f"Error saving risk state: {exc}")
 

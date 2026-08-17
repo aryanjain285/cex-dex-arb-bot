@@ -24,7 +24,7 @@ from .exchange.univ3 import UniV3DexClient
 from .strategy.detector import OpportunityDetector
 from .strategy.router import SimpleRouter
 from .strategy.executor import TransactionExecutor, PaperExecutor
-from .risk.limits import RiskManager
+from .risk.limits import STATE_FILE, RiskManager
 
 # Install uvloop for improved async performance where it is available
 if uvloop is not None:
@@ -46,6 +46,25 @@ _SYMBOL_ALIASES = {
     "BTC": ("BTC", "WBTC"),
     "WBTC": ("WBTC", "BTC"),
 }
+
+
+def risk_state_path_for_mode(mode: str) -> Path:
+    """Where a run of this mode keeps its risk state.
+
+    Modes must not share the file. A paper run accumulated its fictional PnL into
+    the live bot's state, and the profitable direction is the dangerous one: a
+    paper run that "makes" 300 raises the live daily loss allowance by 300 before
+    the live bot has traded at all. That limit is the last control between a
+    malfunction and the end of the capital.
+
+    Paper state still persists -- a multi-day measurement run must not reset its
+    accounting whenever the process bounces -- it simply persists elsewhere. An
+    unrecognised mode gets its own namespace rather than falling back to live, so
+    a typo costs separate bookkeeping instead of contaminating live state.
+    """
+    if mode == "live":
+        return STATE_FILE
+    return STATE_FILE.with_name(f"{STATE_FILE.stem}_{mode}{STATE_FILE.suffix}")
 
 
 def _normalise_pool_symbol(symbol: str) -> str:
@@ -175,7 +194,11 @@ class ArbiBotApp:
             )
         self.cex_client = BinanceCexClient(config.cex, config.secrets, pairs, dashboard_publisher=self.dashboard_publisher)
         self.dex_client = UniV3DexClient(config.dex, config.network, config.secrets, config.tokens)
-        self.risk_manager = RiskManager(config.risk)
+        # Per-mode state: paper PnL must never enter the live daily loss
+        # budget. See risk_state_path_for_mode.
+        self.risk_manager = RiskManager(
+            config.risk, state_path=risk_state_path_for_mode(mode)
+        )
 
         # Durable audit trail. `run_id` ties every row to this process, so runs
         # can be separated after the fact and a replay cannot be confused with

@@ -12,6 +12,13 @@ scanner:
     dex_pool_dataset: "data/target_pools_Dex.json"
     target_quote_currencies: ["USDT", "USDC"]
     arbitrage:
-      edge_threshold_bps: 30
-      cost_buffer_bps: 15
+      # Minimum NET bps -- after the taker fee and gas -- for a candidate to be
+      # reported. Omitted on purpose: the screen then uses strategy.min_net_bps,
+      # so a hit means "the detector would consider this". The previous value of
+      # 30 was 6x the 5 bps the strategy trades at, so the screen was hiding
+      # most of what the strategy would have taken.
+      #
+      # cost_buffer_bps is gone: it was a flat fudge standing in for the taker
+      # fee and gas, which are known exactly. The screen now prices through
+      # costs.evaluate_trade, the same function the detector uses.
       probe_size_base: 1.0
