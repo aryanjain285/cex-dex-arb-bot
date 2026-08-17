@@ -33,6 +33,38 @@ class NetworkConfig(BaseModel):
     priority_fee_gwei: float
     max_fee_gwei: float
 
+    # Chain-side pacing. The exchange side has a request-weight governor; this is
+    # the equivalent for RPC, and it exists because a universe survey against
+    # public endpoints drew sustained 429s -- which were reported upward as "no
+    # pool" until the attribution fix, so a throttled bot looked like an empty
+    # market.
+    #
+    # RPC providers meter by requests per second and concurrent requests, with no
+    # weight header and no published cost per method, and the numbers vary by
+    # provider and plan. So these are deliberately conservative defaults suitable
+    # for a PUBLIC endpoint. Raise them for a paid one -- or better, set the
+    # per-chain override, since a paid endpoint on one chain and a public one on
+    # another is the normal case.
+    rpc_requests_per_second: float = 8.0
+    rpc_max_concurrency: int = 6
+    rpc_requests_per_second_by_chain: Dict[str, float] = {}
+
+    @model_validator(mode='after')
+    def validate_rpc_pacing(self) -> 'NetworkConfig':
+        if self.rpc_requests_per_second <= 0:
+            raise ValueError(
+                "rpc_requests_per_second must be positive; zero would block "
+                "forever, which presents as a hung bot rather than a config error"
+            )
+        if self.rpc_max_concurrency <= 0:
+            raise ValueError("rpc_max_concurrency must be positive")
+        for chain, rate in self.rpc_requests_per_second_by_chain.items():
+            if rate <= 0:
+                raise ValueError(
+                    f"rpc_requests_per_second_by_chain[{chain}] must be positive"
+                )
+        return self
+
     @model_validator(mode='after')
     def load_rpc_urls_from_env(self) -> 'NetworkConfig':
         raw_urls = {

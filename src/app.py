@@ -15,6 +15,7 @@ from .core.types import MarketPair
 from .infra.logging import setup_logging
 from .infra.metrics import setup_metrics
 from .infra.dashboard import DashboardPublisher
+from .infra.cadence import CadenceWatch
 from .infra.evaluation_store import EvaluationStore
 from .scanner.dataset import DatasetError, require_decimals
 from .infra.lifecycle import ShutdownSignal, drain, install_signal_handlers
@@ -492,16 +493,26 @@ class ArbiBotApp:
             await self.shutdown()
 
     async def main_loop(self):
+        # `loop_interval_seconds` is the idle SLEEP between cycles, not the period,
+        # and it is easy to read as the period. Measured live, the real cadence was
+        # 2.32s against a configured 0.2s -- 12x slower, set by RPC latency. A
+        # number that reads like a fact and is wrong by 12x is worse than an absent
+        # one, so the loop reports the gap rather than leaving it to be discovered
+        # from the audit trail weeks later.
+        cadence = CadenceWatch(self.config.strategy.loop_interval_seconds)
+
         while self.running and not self.shutdown_signal.requested:
             cycle_started = clock.monotonic()
             try:
                 opportunities = await self.detector.detect()
+                cycle_seconds = clock.monotonic() - cycle_started
                 try:
-                    metrics.cycle_duration_seconds.observe(
-                        clock.monotonic() - cycle_started
-                    )
+                    metrics.cycle_duration_seconds.observe(cycle_seconds)
                 except Exception:  # pragma: no cover
                     pass
+                divergence = cadence.observe(cycle_seconds)
+                if divergence:
+                    self.logger.warning(divergence)
                 if not opportunities:
                     await asyncio.sleep(self.config.strategy.loop_interval_seconds)
                     continue

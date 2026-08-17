@@ -17,6 +17,7 @@ from .price_oracle import NativePriceOracle
 from ..core.types import MarketPair, DexQuote, DexSwapParams, DexTxReceipt
 from .dex_base import DexClient
 from .errors import RpcError, classify_rpc_failure
+from .rpc_limit import RpcLimiter
 
 TEN_THOUSAND = Decimal("10000")
 
@@ -92,7 +93,9 @@ def _load_abi(path: str) -> Dict:
         raise
 
 class UniV3DexClient(DexClient):
-    def __init__(self, dex_config: DexConfig, net_config: NetworkConfig, secrets: SecretsConfig, tokens_config: Dict[str, Dict[str, 'TokenDetails']]):
+    def __init__(self, dex_config: DexConfig, net_config: NetworkConfig, secrets: SecretsConfig, tokens_config: Dict[str, Dict[str, 'TokenDetails']],
+        rpc_limiter: Optional[RpcLimiter] = None,
+    ):
         self.dex_config = dex_config
         self.net_config = net_config
         self.secrets = secrets
@@ -118,6 +121,16 @@ class UniV3DexClient(DexClient):
         self._factory_contracts: Dict[str, 'Contract'] = {}
         # Native-token USD price, cached with an explicit staleness contract.
         # Fails closed: if gas cannot be priced, the quote is declined.
+        # Paced per chain. The exchange side has had a weight governor for a
+        # while; the chain side had nothing, and a universe survey against
+        # public endpoints drew sustained 429s -- which were reported upward as
+        # "no pool" until the attribution fix.
+        self._rpc_limiter = rpc_limiter or RpcLimiter(
+            requests_per_second=net_config.rpc_requests_per_second,
+            max_concurrency=net_config.rpc_max_concurrency,
+            per_chain_requests_per_second=net_config.rpc_requests_per_second_by_chain,
+        )
+        logger.info(self._rpc_limiter.describe())
         self.price_oracle = NativePriceOracle(
             ttl_seconds=dex_config.native_price_ttl_seconds,
             stale_grace_seconds=dex_config.native_price_stale_grace_seconds,
@@ -129,6 +142,32 @@ class UniV3DexClient(DexClient):
 
     def _from_atomic(self, amount: Decimal, decimals: int) -> Decimal:
         return amount / (10**decimals)
+
+    async def _rpc(self, chain: str, fn, *args, **kwargs):
+        """Every chain call goes through here, paced per chain.
+
+        A single chokepoint rather than a limiter at each of sixteen call sites:
+        the accounting cannot then be bypassed by adding a seventeenth, which is
+        exactly how the exchange side went unmetered for so long. A test asserts
+        via the AST that no `asyncio.to_thread` in this module skips it.
+
+        Long polls are deliberately NOT routed through here -- see
+        `_rpc_unpaced`. Holding a concurrency slot for the length of a receipt wait
+        would let one pending transaction starve every quote.
+        """
+        async with self._rpc_limiter.acquire(chain):
+            return await asyncio.to_thread(fn, *args, **kwargs)
+
+    @staticmethod
+    async def _rpc_unpaced(fn, *args, **kwargs):
+        """A chain call that must not hold a limiter slot.
+
+        Only for waits whose duration is set by the chain rather than by us: a
+        receipt poll can take a minute, and web3 does its own internal polling, so
+        occupying a slot for that long would starve the hot loop while protecting
+        nothing.
+        """
+        return await asyncio.to_thread(fn, *args, **kwargs)
 
     def _get_w3(self, chain: str) -> Web3:
         if chain not in self.w3_instances:
@@ -183,7 +222,7 @@ class UniV3DexClient(DexClient):
             return factory.functions.getPool(token_a, token_b, int(fee)).call()
 
         try:
-            pool_address = await asyncio.to_thread(_call)
+            pool_address = await self._rpc(chain, _call)
         except Exception as exc:
             if classify_rpc_failure(exc):
                 # Surfaced rather than swallowed: a throttled lookup reported as
@@ -221,7 +260,7 @@ class UniV3DexClient(DexClient):
             return factory.functions.getPool(token_a, token_b, int(fee)).call()
 
         try:
-            pool_address = await asyncio.to_thread(_call)
+            pool_address = await self._rpc(chain, _call)
         except Exception as exc:
             logger.warning(f"Uniswap pool lookup failed ({base_symbol}/{quote_symbol} {chain} fee={fee}): {exc}")
             return None
@@ -236,7 +275,7 @@ class UniV3DexClient(DexClient):
         try:
             # native token, e.g. ETH on mainnet
             if asset == self.net_config.native_token.get(chain):
-                balance_wei = await asyncio.to_thread(w3.eth.get_balance, self.user_address)
+                balance_wei = await self._rpc(chain, w3.eth.get_balance, self.user_address)
                 balance = Decimal(balance_wei) / Decimal(10**18)
                 logger.debug(f"Native token {asset} balance on {chain}: {balance}")
                 return balance
@@ -246,8 +285,8 @@ class UniV3DexClient(DexClient):
             token_address = Web3.to_checksum_address(token_details.address)
             token_contract = w3.eth.contract(address=token_address, abi=self.erc20_abi)
             
-            balance_wei = await asyncio.to_thread(
-                token_contract.functions.balanceOf(self.user_address).call
+            balance_wei = await self._rpc(
+                chain, token_contract.functions.balanceOf(self.user_address).call
             )
             
             balance = Decimal(balance_wei) / (Decimal(10) ** token_details.decimals)
@@ -309,7 +348,10 @@ class UniV3DexClient(DexClient):
             params = (token_in, token_out, int(amount_in_atomic), fee, 0)
 
             # .call() is synchronous; run it in a thread so the loop is not blocked
-            raw = await asyncio.to_thread(lambda: quoter.functions.quoteExactInputSingle(params).call())
+            raw = await self._rpc(
+                pair.dex_chain,
+                lambda: quoter.functions.quoteExactInputSingle(params).call(),
+            )
 
             # different ABIs return either (amountOut, sqrtPriceX96After, ticks, gas) or just amountOut
             amount_out_atomic = int(raw[0]) if isinstance(raw, (list, tuple)) else int(raw)
@@ -329,7 +371,9 @@ class UniV3DexClient(DexClient):
             gas_cost_quote = ZERO_DEC
 
             if estimate_gas:
-                gas_price_wei = await asyncio.to_thread(lambda: w3.eth.gas_price)
+                gas_price_wei = await self._rpc(
+                    pair.dex_chain, lambda: w3.eth.gas_price
+                )
                 priced = await self._gas_cost_in_quote(
                     oracle=self.price_oracle,
                     chain=pair.dex_chain,
@@ -411,11 +455,15 @@ class UniV3DexClient(DexClient):
             'maxFeePerGas': max_wei,
         }
 
-    async def _approve_token(self, w3: Web3, token_address: str, router_address: str, required_amount: int):
+    async def _approve_token(
+        self, w3: Web3, chain: str, token_address: str, router_address: str,
+        required_amount: int,
+    ):
         token_contract = w3.eth.contract(address=token_address, abi=self.erc20_abi)
 
-        allowance = await asyncio.to_thread(
-            token_contract.functions.allowance(self.user_address, router_address).call
+        allowance = await self._rpc(
+            chain,
+            token_contract.functions.allowance(self.user_address, router_address).call,
         )
         if allowance >= required_amount:
             logger.debug(f"Token {token_address} already has sufficient allowance.")
@@ -429,7 +477,9 @@ class UniV3DexClient(DexClient):
         # 200k-gas swap on a sub-gwei chain that is a rounding error against the
         # exposure it removes.
         amount_to_approve = required_amount
-        nonce = await asyncio.to_thread(w3.eth.get_transaction_count, self.user_address)
+        nonce = await self._rpc(
+            chain, w3.eth.get_transaction_count, self.user_address
+        )
 
         tx_params = {
             'from': self.user_address,
@@ -437,15 +487,24 @@ class UniV3DexClient(DexClient):
             **await self._fee_params(w3),
         }
 
-        approve_tx = await asyncio.to_thread(
-            token_contract.functions.approve(router_address, amount_to_approve).build_transaction, tx_params
+        approve_tx = await self._rpc(
+            chain,
+            token_contract.functions.approve(router_address, amount_to_approve).build_transaction,
+            tx_params,
         )
         
         signed_tx = w3.eth.account.sign_transaction(approve_tx, self.secrets.dex_wallet_private_key.get_secret_value())
-        tx_hash = await asyncio.to_thread(w3.eth.send_raw_transaction, signed_tx.raw_transaction)
+        tx_hash = await self._rpc(
+            chain, w3.eth.send_raw_transaction, signed_tx.raw_transaction
+        )
         logger.info(f"Approval transaction sent: {tx_hash.hex()}")
         
-        receipt = await asyncio.to_thread(w3.eth.wait_for_transaction_receipt, tx_hash, timeout=self.net_config.max_pending_seconds)
+        # Unpaced: a receipt wait is as long as the chain makes it, and holding
+        # a limiter slot for that would starve every quote.
+        receipt = await self._rpc_unpaced(
+            w3.eth.wait_for_transaction_receipt, tx_hash,
+            timeout=self.net_config.max_pending_seconds,
+        )
         if receipt['status'] == 1:
             logger.success(f"Token {token_address} approved successfully.")
             return True
@@ -460,11 +519,15 @@ class UniV3DexClient(DexClient):
         token_out_addr = Web3.to_checksum_address(params.token_out_address)
         amount_in_wei = int(params.amount_in * (10**params.token_in_decimals))
 
-        await self._approve_token(w3, token_in_addr, router_address, amount_in_wei)
+        await self._approve_token(
+            w3, params.chain, token_in_addr, router_address, amount_in_wei
+        )
 
         logger.info(f"Preparing DEX swap on {params.chain}: {params.amount_in} of token {params.token_in_address}")
         router_contract = w3.eth.contract(address=router_address, abi=self.router_abi)
-        nonce = await asyncio.to_thread(w3.eth.get_transaction_count, self.user_address)
+        nonce = await self._rpc(
+            params.chain, w3.eth.get_transaction_count, self.user_address
+        )
 
         # From the caller's floor, which DexSwapParams requires to be positive.
         # The router enforces it on-chain: the swap reverts rather than filling
@@ -494,17 +557,28 @@ class UniV3DexClient(DexClient):
             'nonce': nonce,
             **await self._fee_params(w3),
         }
-        tx_params['gas'] = await asyncio.to_thread(router_contract.functions.exactInputSingle(swap_params_struct).estimate_gas, {'from': self.user_address, 'value': 0})
+        tx_params['gas'] = await self._rpc(
+            params.chain,
+            router_contract.functions.exactInputSingle(swap_params_struct).estimate_gas,
+            {'from': self.user_address, 'value': 0},
+        )
 
         try:
-            swap_tx = await asyncio.to_thread(
-                router_contract.functions.exactInputSingle(swap_params_struct).build_transaction, tx_params
+            swap_tx = await self._rpc(
+                params.chain,
+                router_contract.functions.exactInputSingle(swap_params_struct).build_transaction,
+                tx_params,
             )
             signed_tx = w3.eth.account.sign_transaction(swap_tx, self.secrets.dex_wallet_private_key.get_secret_value())
-            tx_hash = await asyncio.to_thread(w3.eth.send_raw_transaction, signed_tx.raw_transaction)
+            tx_hash = await self._rpc(
+                params.chain, w3.eth.send_raw_transaction, signed_tx.raw_transaction
+            )
             logger.info(f"DEX swap transaction sent: {tx_hash.hex()}")
 
-            receipt = await asyncio.to_thread(w3.eth.wait_for_transaction_receipt, tx_hash, timeout=self.net_config.max_pending_seconds)
+            receipt = await self._rpc_unpaced(
+                w3.eth.wait_for_transaction_receipt, tx_hash,
+                timeout=self.net_config.max_pending_seconds,
+            )
             
             if receipt['status'] == 1:
                 logger.success(f"DEX swap succeeded. Tx: {tx_hash.hex()}")
