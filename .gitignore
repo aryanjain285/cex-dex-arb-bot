@@ -28,6 +28,15 @@ data/*.yaml
 !data/target_pools_Dex.json
 !data/.gitkeep
 
+# The evaluation store and its SQLite sidecars. These were tracked by mistake for
+# several commits, which meant a clone shipped MY test-run data: an operator's first
+# `analyse` would have reported my numbers under my run_ids, which is exactly the
+# stale-data-producing-stale-decisions failure the audit trail exists to prevent.
+# The -wal file reached 4 MB of binary churn.
+data/*.sqlite3
+data/*.sqlite3-shm
+data/*.sqlite3-wal
+
 # Node
 node_modules/
 dashboard/backend/node_modules/
