@@ -462,8 +462,22 @@ class ArbiBotApp:
         await self.cex_client.connect()
 
         if self.config.risk.cancel_all_on_start:
-            self.logger.info("Cancelling all existing CEX orders (not yet implemented)...")
-            # await self.cex_client.cancel_all_orders()
+            # The call site used to be commented out, so the flag was a promise
+            # the system did not keep: a resting order from a previous run could
+            # fill into a market that had moved while the operator believed the
+            # book had been cleared.
+            #
+            # Paper mode does not place orders, so it has none to cancel -- and
+            # cancelling from a paper process would reach into the live account.
+            if self.mode == "live":
+                self.logger.info("Cancelling all existing CEX orders...")
+                cancelled = await self.cex_client.cancel_all_orders()
+                self.logger.info(f"Cancelled {cancelled} pre-existing order(s).")
+            else:
+                self.logger.info(
+                    f"Skipping cancel-all in {self.mode} mode: this process places "
+                    f"no orders, and cancelling would reach into the live account."
+                )
 
         self.logger.info("Bot started; waiting for the CEX order book to synchronise...")
         # Give the WebSocket order book a few seconds to perform its initial sync
@@ -548,6 +562,26 @@ class ArbiBotApp:
         if self._cycle_task is not None:
             await drain([self._cycle_task],
                         timeout=self.config.strategy.shutdown_drain_seconds)
+
+        # Before closing the session, and after the loop has stopped placing new
+        # ones. `cancel_all_on_shutdown` was configured and validated and had no
+        # call site at all -- so an operator who set it still left resting orders
+        # behind, which is precisely the state it exists to prevent: an order that
+        # fills while nothing is running to hedge it.
+        if self.config.risk.cancel_all_on_shutdown and self.mode == "live":
+            try:
+                cancelled = await self.cex_client.cancel_all_orders()
+                self.logger.info(
+                    f"Cancelled {cancelled} open order(s) during shutdown."
+                )
+            except Exception as exc:
+                # Shutdown must complete. A failure here is loud but not fatal;
+                # the alternative is a process that will not exit.
+                self.logger.error(
+                    f"Failed to cancel open orders during shutdown: {exc}. "
+                    f"CHECK THE EXCHANGE for resting orders before restarting."
+                )
+
         await self.cex_client.close()
         # The Prometheus server runs as a daemon thread; no explicit stop is required.
         if self.dashboard_publisher:

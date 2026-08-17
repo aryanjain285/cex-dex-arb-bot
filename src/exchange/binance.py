@@ -16,6 +16,84 @@ from ..core import clock
 from ..core.config import CexConfig, SecretsConfig
 from ..core.types import BookSnapshot, MarketPair, Quote
 from .cex_base import CexClient, CexOrder, OrderUpdate
+
+# Binance's own status vocabulary, mapped to ours. Exhaustive rather than
+# defaulted: the previous version mapped BOTH "NEW" and anything unrecognised to
+# "partially_filled", so a resting order and a status Binance had not yet invented
+# both reported a partial fill -- a claim about inventory that did not exist.
+_BINANCE_ORDER_STATUS = {
+    "NEW": "new",
+    "PENDING_NEW": "new",
+    "PARTIALLY_FILLED": "partially_filled",
+    "FILLED": "filled",
+    "CANCELED": "canceled",
+    "PENDING_CANCEL": "canceled",
+    "EXPIRED": "canceled",
+    # An IOC or FOK order that could not be matched. Distinct from CANCELED only
+    # in cause, and both mean no further fill is coming.
+    "EXPIRED_IN_MATCH": "canceled",
+    "REJECTED": "rejected",
+}
+
+
+def _translate_order_status(raw: str):
+    """Our status for an exchange status, plus a reason when it is unrecognised.
+
+    An unknown status maps to "unknown", never to a fill or a rejection: the state
+    is genuinely indeterminate, and the only safe reading is that it must be
+    reconciled. The raw value is preserved so the log says what actually arrived.
+    """
+    mapped = _BINANCE_ORDER_STATUS.get(raw)
+    if mapped is None:
+        return "unknown", f"unrecognised exchange status {raw!r}"
+    return mapped, None
+
+
+def _achieved_price(data: dict, filled_size: Decimal):
+    """The average price actually obtained, or None if nothing filled.
+
+    Binance's spot order response has no `avgPrice` field, and `price` is the
+    LIMIT price -- "0.00000000" for a market order. The previous code read
+    `data.get('avgPrice') or data.get('price')`, so a market order's achieved price
+    was reported as zero and a limit order's as the price asked for rather than the
+    one obtained. PnL from either is fiction.
+
+    Two correct sources, in order of preference:
+
+    * `fills[]`, a size-weighted average of the actual matches. Present when
+      newOrderRespType is FULL, which is the default for MARKET and LIMIT.
+    * `cummulativeQuoteQty / executedQty` -- Binance's own spelling, with the
+      doubled m. Exact, and available even on an ACK response.
+    """
+    if filled_size <= 0:
+        # None, not zero: a zero would flow into PnL as a real price and value the
+        # position at nothing.
+        return None
+
+    fills = data.get('fills') or []
+    if fills:
+        total_quote = Decimal("0")
+        total_base = Decimal("0")
+        for fill in fills:
+            qty = Decimal(str(fill.get('qty', '0')))
+            price = Decimal(str(fill.get('price', '0')))
+            total_base += qty
+            total_quote += qty * price
+        if total_base > 0:
+            return total_quote / total_base
+
+    quote_qty = data.get('cummulativeQuoteQty')
+    if quote_qty is not None:
+        quote_total = Decimal(str(quote_qty))
+        if quote_total > 0:
+            return quote_total / filled_size
+
+    logger.error(
+        f"Order reports {filled_size} filled but neither fills[] nor "
+        f"cummulativeQuoteQty gives an achieved price. The fill price is unknown; "
+        f"reconcile from the exchange before relying on any PnL for it."
+    )
+    return None
 from ..infra import metrics
 
 if TYPE_CHECKING:  # pragma: no cover
@@ -471,11 +549,20 @@ class BinanceCexClient(CexClient):
             'side': order.side.upper(),
             'type': order.type.upper(),
             'quantity': f"{order.size:.{order.pair.base_precision}f}",
-            'timestamp': int(time.time() * 1000)
+            # The one process clock, not a second call to time.time().
+            'timestamp': clock.now_ms(),
+            # Was never sent, so Binance applied its own 5000ms default and the
+            # configured, validated value did nothing.
+            'recvWindow': self.config.recv_window_ms,
         }
         if order.type == 'LIMIT':
             params['price'] = f"{order.price:.{order.pair.quote_precision}f}"
-            params['timeInForce'] = 'GTC'
+            # From the order, not hardcoded. `CexOrder.tif` already existed and
+            # already defaulted to IOC, and this line said GTC -- the worst of the
+            # three for arbitrage, because a resting order can fill minutes later
+            # once the opportunity is gone, leaving an unhedged position.
+            params['timeInForce'] = order.tif
+        # Binance rejects timeInForce on a MARKET order, so it is set only above.
 
         params['signature'] = self._get_signature(params)
         
@@ -495,33 +582,35 @@ class BinanceCexClient(CexClient):
                 data = orjson.loads(body)
                 logger.info("CEX order created: %s", data)
 
-                status_raw = str(data.get('status', '')).lower()
-                status_map = {
-                    "new": "partially_filled",
-                    "partially_filled": "partially_filled",
-                    "partial_fill": "partially_filled",
-                    "partial_filled": "partially_filled",
-                    "filled": "filled",
-                    "canceled": "canceled",
-                    "expired": "canceled",
-                    "rejected": "rejected",
-                }
-                status = status_map.get(status_raw, "partially_filled")
+                status_raw = str(data.get('status', '')).upper()
+                status, reason = _translate_order_status(status_raw)
 
                 filled_size = Decimal(str(data.get('executedQty', '0')))
-                avg_price_value = data.get('avgPrice') or data.get('price') or '0'
-                avg_fill_price = Decimal(str(avg_price_value))
-                ts_ms = data.get('transactTime') or data.get('updateTime') or int(time.time() * 1000)
-                ts = float(ts_ms) / 1000 if ts_ms else time.time()
+                avg_fill_price = _achieved_price(data, filled_size)
+
+                ts_ms = (
+                    data.get('transactTime') or data.get('updateTime')
+                    or clock.now_ms()
+                )
+                ts = float(ts_ms) / 1000
 
                 order_id = str(data['orderId'])
                 self._order_pair_cache[order_id] = order.pair
 
+                if status == "unknown":
+                    logger.error(
+                        f"Binance returned an unrecognised order status "
+                        f"{status_raw!r} for order {order_id}. Treating the state "
+                        f"as indeterminate rather than as a fill; reconcile before "
+                        f"trading this pair again."
+                    )
+
                 return OrderUpdate(
-                    order_id=str(data['orderId']),
+                    order_id=order_id,
                     status=status,
                     avg_fill_price=avg_fill_price,
                     filled_size=filled_size,
+                    reason=reason,
                     ts=ts,
                 )
         except aiohttp.ClientResponseError as e:
@@ -553,6 +642,99 @@ class BinanceCexClient(CexClient):
             return Decimal("-1") # a negative value signals a query error
 
     async def cancel_order(self, order_id: str, pair: MarketPair) -> bool:
-        # TODO: implement order cancellation
-        logger.info(f"Simulated order cancellation: {order_id}")
-        return True
+        """Cancel one order. Returns whether the exchange confirmed it.
+
+        This was a stub that logged "Simulated order cancellation" and returned
+        True. Returning False would have been an obvious gap; returning True was a
+        lie in the dangerous direction, because cancelling the unfilled leg is the
+        standard unwind for a half-executed arbitrage -- and a caller told the
+        cancel succeeded stops tracking an order that then fills, unhedged.
+
+        Never raises. This runs on the unwind path, usually while already handling
+        a failure, and an exception there would replace a recoverable position with
+        an unhandled one.
+        """
+        if not self._session:
+            logger.error(f"Cannot cancel order {order_id}: no session.")
+            return False
+
+        symbol = pair.cex_symbol.replace('/', '')
+        params = {
+            'symbol': symbol,
+            'orderId': order_id,
+            'timestamp': clock.now_ms(),
+            'recvWindow': self.config.recv_window_ms,
+        }
+        params['signature'] = self._get_signature(params)
+
+        try:
+            async with self._session.delete(
+                f"{self.base_url}/api/v3/order", params=params
+            ) as response:
+                body = await response.text()
+                self.governor.observe_headers(response.headers)
+                if response.status >= 400:
+                    logger.error(
+                        f"Failed to cancel order {order_id} on {symbol} "
+                        f"[{response.status}]: {body}"
+                    )
+                    return False
+                logger.info(f"Cancelled order {order_id} on {symbol}.")
+                return True
+        except Exception as exc:
+            logger.error(
+                f"Error cancelling order {order_id} on {symbol}: "
+                f"{type(exc).__name__}: {exc}"
+            )
+            return False
+
+    async def cancel_all_orders(self) -> int:
+        """Cancel every open order on every configured symbol.
+
+        Returns how many the exchange reported cancelling, so the caller can log a
+        number rather than an assumption.
+
+        Binance's DELETE /api/v3/openOrders is per symbol, so "all" is one request
+        each. A single call would have cleared only the first pair and left the
+        rest resting -- which is exactly the state `cancel_all_on_start` exists to
+        prevent.
+
+        One symbol failing does not stop the others: a symbol with no open orders
+        returns an error, and treating that as fatal would leave every later
+        symbol uncleared.
+        """
+        if not self._session:
+            logger.error("Cannot cancel open orders: no session.")
+            return 0
+
+        total = 0
+        for symbol in sorted({p.cex_symbol.replace('/', '') for p in self.pairs}):
+            params = {
+                'symbol': symbol,
+                'timestamp': clock.now_ms(),
+                'recvWindow': self.config.recv_window_ms,
+            }
+            params['signature'] = self._get_signature(params)
+            try:
+                async with self._session.delete(
+                    f"{self.base_url}/api/v3/openOrders", params=params
+                ) as response:
+                    body = await response.text()
+                    self.governor.observe_headers(response.headers)
+                    if response.status >= 400:
+                        # -2011 "Unknown order sent" is what an empty book returns.
+                        logger.info(
+                            f"No open orders cancelled on {symbol} "
+                            f"[{response.status}]: {body}"
+                        )
+                        continue
+                    cancelled = orjson.loads(body)
+                    count = len(cancelled) if isinstance(cancelled, list) else 1
+                    total += count
+                    logger.info(f"Cancelled {count} open order(s) on {symbol}.")
+            except Exception as exc:
+                logger.error(
+                    f"Error cancelling open orders on {symbol}: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+        return total

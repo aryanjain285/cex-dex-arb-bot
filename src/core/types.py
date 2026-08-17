@@ -201,9 +201,26 @@ class CexOrder(BaseModel):
     ts: float
 
 class OrderUpdate(BaseModel):
+    """What the exchange says about an order.
+
+    `new` and `unknown` are here because their absence caused a real defect: with
+    only the four filled/cancelled states available, a resting order and an
+    unrecognised status were both mapped to `partially_filled` -- so an order with
+    nothing filled reported a partial fill, and a caller that hedged against it
+    would have hedged a position it did not hold.
+
+    `unknown` means the exchange returned a status this code does not recognise.
+    It is deliberately not a fill claim and not a rejection: the state is
+    indeterminate and must be reconciled, and `reason` carries the raw value.
+    """
+
     order_id: str
-    status: Literal["partially_filled","filled","canceled","rejected"]
+    status: Literal[
+        "new", "partially_filled", "filled", "canceled", "rejected", "unknown"
+    ]
     filled_size: Decimal
+    # None when nothing filled. Zero would be a number flowing into PnL as a real
+    # price, valuing the position at nothing.
     avg_fill_price: Optional[Decimal] = None
     reason: Optional[str] = None
     ts: float
