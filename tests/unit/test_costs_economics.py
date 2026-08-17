@@ -205,3 +205,25 @@ def test_unknown_direction_is_rejected():
             direction="SIDEWAYS", size_base=D(1), cex_price=D(1000),
             dex_price=D(1010), taker_fee_bps=FEE_BPS, gas_quote=D(1),
         )
+
+
+def test_economics_carries_venue_attributed_prices():
+    """The audit record must know which venue each price came from.
+
+    buy_price/sell_price are direction-relative, so re-deriving the venue at
+    every call site invites a sign error. Carrying both attributions makes the
+    record self-describing.
+    """
+    c2d = evaluate_trade(
+        direction="CEX_to_DEX", size_base=D(1), cex_price=D(1000),
+        dex_price=D(1010), taker_fee_bps=FEE_BPS, gas_quote=D(0),
+    )
+    assert c2d.cex_price == D(1000) and c2d.dex_price == D(1010)
+    assert c2d.buy_price == c2d.cex_price and c2d.sell_price == c2d.dex_price
+
+    d2c = evaluate_trade(
+        direction="DEX_to_CEX", size_base=D(1), cex_price=D(1010),
+        dex_price=D(1000), taker_fee_bps=FEE_BPS, gas_quote=D(0),
+    )
+    assert d2c.cex_price == D(1010) and d2c.dex_price == D(1000)
+    assert d2c.buy_price == d2c.dex_price and d2c.sell_price == d2c.cex_price

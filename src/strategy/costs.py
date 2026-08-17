@@ -109,8 +109,14 @@ class TradeEconomics:
 
     direction: str
     size_base: Decimal
+    # Direction-relative, for the PnL arithmetic.
     buy_price: Decimal
     sell_price: Decimal
+    # Venue-attributed, so an audit record is self-describing and no consumer
+    # has to re-derive which venue a price came from -- a re-derivation that
+    # invites a sign error at every call site.
+    cex_price: Decimal
+    dex_price: Decimal
     notional_quote: Decimal
     gross_quote: Decimal
     cex_fee_quote: Decimal
@@ -187,6 +193,8 @@ def evaluate_trade(
         size_base=size_base,
         buy_price=buy_price,
         sell_price=sell_price,
+        cex_price=cex_price,
+        dex_price=dex_price,
         notional_quote=notional_quote,
         gross_quote=gross_quote,
         cex_fee_quote=cex_fee_quote,

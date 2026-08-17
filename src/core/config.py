@@ -164,6 +164,12 @@ class ObservabilityConfig(BaseModel):
     log_level: str
     redact_keys: List[str]
 
+    # Durable audit trail of EVERY evaluation, including rejections and their
+    # reasons. Without it a run produces log scrollback rather than a dataset,
+    # and none of the questions a paper run exists to answer can be answered.
+    evaluation_store_enabled: bool = True
+    evaluation_store_path: str = "data/evaluations.sqlite3"
+
 class DashboardConfig(BaseModel):
     enabled: bool = False
     redis_url: str = "redis://localhost:6379/0"

@@ -1,6 +1,7 @@
 import asyncio
 import json
-from typing import List
+import uuid
+from typing import List, Optional
 from pathlib import Path
 
 try:
@@ -8,11 +9,13 @@ try:
 except ImportError:  # uvloop does not support Windows
     uvloop = None
 
+from .core import clock
 from .core.config import load_config, AppConfig
 from .core.types import MarketPair
 from .infra.logging import setup_logging
 from .infra.metrics import setup_metrics
 from .infra.dashboard import DashboardPublisher
+from .infra.evaluation_store import EvaluationStore
 from .exchange.binance import BinanceCexClient
 from .exchange.univ3 import UniV3DexClient
 from .strategy.detector import OpportunityDetector
@@ -85,7 +88,27 @@ class ArbiBotApp:
         self.cex_client = BinanceCexClient(config.cex, config.secrets, pairs, dashboard_publisher=self.dashboard_publisher)
         self.dex_client = UniV3DexClient(config.dex, config.network, config.secrets, config.tokens)
         self.risk_manager = RiskManager(config.risk)
-        self.detector = OpportunityDetector(config.strategy, self.cex_client, self.dex_client, pairs)
+
+        # Durable audit trail. `run_id` ties every row to this process, so runs
+        # can be separated after the fact and a replay cannot be confused with
+        # live data.
+        self.run_id = f"{int(clock.now())}-{uuid.uuid4().hex[:8]}"
+        self.evaluation_store: Optional[EvaluationStore] = None
+        if config.observability.evaluation_store_enabled:
+            self.evaluation_store = EvaluationStore(
+                config.observability.evaluation_store_path, run_id=self.run_id
+            )
+            self.logger.info(f"Recording evaluations under run_id={self.run_id}.")
+        else:
+            self.logger.warning(
+                "Evaluation store is DISABLED. This run will produce no audit "
+                "trail and no measurable dataset."
+            )
+
+        self.detector = OpportunityDetector(
+            config.strategy, self.cex_client, self.dex_client, pairs,
+            store=self.evaluation_store,
+        )
         self.router = SimpleRouter()
 
         # Select the executor based on the run mode
@@ -236,4 +259,10 @@ class ArbiBotApp:
         # The Prometheus server runs as a daemon thread; no explicit stop is required.
         if self.dashboard_publisher:
             await self.dashboard_publisher.close()
+        if self.evaluation_store:
+            recorded = self.evaluation_store.count()
+            self.evaluation_store.close()
+            self.logger.info(
+                f"Evaluation store closed: {recorded} rows recorded this run."
+            )
         self.logger.info("Bot shut down cleanly.")

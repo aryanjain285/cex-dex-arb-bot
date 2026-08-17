@@ -148,6 +148,13 @@ observability:
   # Fields whose names contain any of these substrings are masked in logs
   redact_keys: ["key", "secret", "token", "password", "private_key"]
 
+  # Durable audit trail. Every evaluation is recorded, not only the ones
+  # that cross the threshold -- the near-miss distribution is what reveals
+  # whether an edge exists and whether the threshold is set correctly.
+  # Roughly 267 bytes/row, so budget disk before raising the pair count.
+  evaluation_store_enabled: true
+  evaluation_store_path: "data/evaluations.sqlite3"
+
 dashboard:
   enabled: true
   redis_url: "redis://localhost:6379/0"
