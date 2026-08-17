@@ -1,7 +1,7 @@
 from __future__ import annotations
 from typing import List, Optional, Literal
 from decimal import Decimal
-from pydantic import BaseModel
+from pydantic import BaseModel, model_validator
 from dataclasses import dataclass
 
 ZERO = Decimal("0")
@@ -129,13 +129,56 @@ class Opportunity(BaseModel):
 # --- DEX Specific Types ---
 
 class DexSwapParams(BaseModel):
+    """A swap request, which cannot be constructed without an output floor.
+
+    `execute_swap` previously hardcoded `amount_out_minimum = 0` under a comment
+    saying it MUST be derived before production use. A comment is not a control.
+    With a zero floor the router accepts ANY output, so a sandwich attack can take
+    the entire trade value -- and the loss is bounded by the pool's liquidity, not
+    by the trade size.
+
+    Making the floor a REQUIRED field moves the guarantee from a comment to the
+    type: pydantic rejects an unprotected swap at every call site, including the
+    ones not written yet. Nothing constructs this type today, which is exactly
+    when to make it strict.
+    """
+
     chain: str
     token_in_address: str
     token_in_decimals: int
     token_out_address: str
+    # Needed to convert the floor into the router's integer units. Its absence is
+    # why the floor could not have been computed here before.
+    token_out_decimals: int
     fee: int
     amount_in: Decimal
+    # The minimum acceptable output, in token-out units. Derived by the caller
+    # from the quote and the pair's slippage tolerance.
+    min_amount_out: Decimal
+    # Recorded for the audit trail: it says which tolerance produced the floor.
+    # It is NOT a cost and never enters the trade economics.
     slippage_bps: int
+
+    @model_validator(mode='after')
+    def validate_swap(self) -> 'DexSwapParams':
+        if self.amount_in <= 0:
+            raise ValueError(f"amount_in must be positive, got {self.amount_in}")
+        if self.min_amount_out <= 0:
+            raise ValueError(
+                f"min_amount_out must be positive, got {self.min_amount_out}. A "
+                f"zero floor lets the router fill at any price, which is an "
+                f"unbounded loss to a sandwich attack."
+            )
+        for name, value in (("token_in_decimals", self.token_in_decimals),
+                            ("token_out_decimals", self.token_out_decimals)):
+            if not 0 <= value <= 36:
+                raise ValueError(
+                    f"{name} is {value}, outside the plausible range 0..36. A "
+                    f"wrong decimals value is a 10^n error in the amount sent."
+                )
+        if self.slippage_bps < 0:
+            raise ValueError("slippage_bps must not be negative")
+        return self
 
 class DexTxReceipt(BaseModel):
     tx_hash: str

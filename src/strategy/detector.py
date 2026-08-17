@@ -113,7 +113,7 @@ class OpportunityDetector:
         self._rotation_cost_quote = self._compute_rotation_cost()
         placebo_cfg = strategy_config.placebo
         self._placebo = (
-            DelayedQuoteBuffer(placebo_cfg.delay_cycles)
+            DelayedQuoteBuffer(placebo_cfg.delay_seconds)
             if placebo_cfg.enabled else None
         )
         # Built once. Constructing it per evaluation would put a validation
@@ -525,11 +525,11 @@ class OpportunityDetector:
         * Size is held at the live size rather than re-derived from the stale
           price. Re-deriving would change the CEX depth consumed too, mixing a
           size effect into what is meant to isolate a price effect.
-        * "N cycles ago" counts cycles that produced a quote, not wall-clock
-          cycles. A cycle rejected before the DEX call pushes nothing, so the
-          delay is measured in observations rather than in seconds. That is the
-          comparison that matters -- both arms are then real observations of the
-          same venue -- but it means the lag is not a fixed duration.
+        * The delay is wall-clock and must exceed the slowest quoted chain's
+          block time, which the config validator enforces. A DEX quote changes
+          only when a block lands, so a sub-block delay compares a quote to
+          itself: measured live, a one-second delay against Ethereum produced
+          live and placebo values identical in 69% of paired observations.
         """
         if self._placebo is None:
             return None

@@ -17,6 +17,68 @@ from .price_oracle import NativePriceOracle
 from ..core.types import MarketPair, DexQuote, DexSwapParams, DexTxReceipt
 from .dex_base import DexClient
 
+TEN_THOUSAND = Decimal("10000")
+
+
+def min_amount_out_wei(
+    expected_out: Decimal, slippage_bps: int, token_out_decimals: int
+) -> int:
+    """The router's `amountOutMinimum`, in the token's integer units.
+
+    This is the only protection against a sandwich attack. The previous code
+    passed 0 under a comment saying it MUST be derived first: with a zero floor
+    the router accepts any output at all, so an attacker moves the pool, our swap
+    executes at whatever price results, and the attacker closes. The loss is
+    bounded by the pool's liquidity rather than by the trade size.
+
+    Rounds DOWN. Rounding up would set a floor above what the quote promised, so a
+    swap that filled exactly as quoted would revert -- a failure that presents as
+    a market problem while actually being an arithmetic one.
+
+    `slippage_bps` is a tolerance, not a cost: it never enters the trade
+    economics. It only decides how far from the quote a fill may land before the
+    router refuses it.
+    """
+    if expected_out <= 0:
+        raise ValueError(
+            f"expected_out must be positive, got {expected_out}; there is no "
+            f"meaningful floor below a non-positive expectation"
+        )
+    if slippage_bps < 0:
+        raise ValueError(
+            f"slippage_bps must not be negative, got {slippage_bps}. A negative "
+            f"tolerance demands more than the quote and reverts every swap."
+        )
+    if slippage_bps >= 10_000:
+        raise ValueError(
+            f"slippage_bps must be below 10000 (100%), got {slippage_bps}. A "
+            f"whole-turn tolerance makes the floor zero, which is exactly the "
+            f"unprotected case this function exists to prevent."
+        )
+    if not 0 <= token_out_decimals <= 36:
+        raise ValueError(
+            f"token_out_decimals is {token_out_decimals}, outside 0..36"
+        )
+
+    floor = expected_out * (TEN_THOUSAND - Decimal(slippage_bps)) / TEN_THOUSAND
+    # int() truncates toward zero, which is the rounding-down this needs.
+    raw = int(floor * (Decimal(10) ** token_out_decimals))
+
+    if raw <= 0:
+        # Found by a property test over sizes and decimals: 1 raw unit of
+        # expected output with a 1 bps tolerance rounds to a floor of zero, which
+        # is the unprotected case. Clamping to 1 would convert "no protection"
+        # into a fiction, so this refuses instead. Such a trade is dust -- gas
+        # alone exceeds its entire output by orders of magnitude -- and the
+        # sizing checks upstream should never produce it.
+        raise ValueError(
+            f"a floor of {floor} token-out units rounds to zero at "
+            f"{token_out_decimals} decimals, so this swap cannot be protected. "
+            f"Expected output {expected_out} is at the token's resolution limit; "
+            f"refusing to send an unprotected swap."
+        )
+    return raw
+
 ZERO_DEC = Decimal("0")
 
 # --- ABI helpers ---
@@ -264,9 +326,38 @@ class UniV3DexClient(DexClient):
         gas_cost_native = Decimal(gas_units) * Decimal(gas_price_wei) / Decimal(10 ** 18)
         return gas_cost_native * native_price
 
+    async def _fee_params(self, w3: Web3) -> Dict[str, int]:
+        """EIP-1559 fee fields, from config values that nothing previously read.
+
+        `network.priority_fee_gwei` and `network.max_fee_gwei` existed in config
+        and were used nowhere: every transaction went out with the legacy
+        `gasPrice` field. A legacy transaction is still accepted post-London, but
+        its fee cannot be adjusted afterwards, so one submitted into a rising base
+        fee simply sits until it is dropped -- with an arbitrage leg already
+        executed on the other venue.
+
+        The configured max fee is a ceiling on what a trade may pay. It is
+        deliberately not derived from the current base fee: an automatic multiple
+        would let a fee spike spend an unbounded amount of the edge.
+        """
+        priority_wei = int(
+            Decimal(str(self.net_config.priority_fee_gwei)) * Decimal(10**9)
+        )
+        max_wei = int(Decimal(str(self.net_config.max_fee_gwei)) * Decimal(10**9))
+        if priority_wei > max_wei:
+            raise ValueError(
+                f"network.priority_fee_gwei ({self.net_config.priority_fee_gwei}) "
+                f"exceeds network.max_fee_gwei ({self.net_config.max_fee_gwei}); "
+                f"the transaction would be rejected as malformed."
+            )
+        return {
+            'maxPriorityFeePerGas': priority_wei,
+            'maxFeePerGas': max_wei,
+        }
+
     async def _approve_token(self, w3: Web3, token_address: str, router_address: str, required_amount: int):
         token_contract = w3.eth.contract(address=token_address, abi=self.erc20_abi)
-        
+
         allowance = await asyncio.to_thread(
             token_contract.functions.allowance(self.user_address, router_address).call
         )
@@ -275,15 +366,21 @@ class UniV3DexClient(DexClient):
             return True
 
         logger.info(f"Approving token {token_address} for router {router_address}...")
-        amount_to_approve = 2**256 - 1 # Approve max
+        # Exactly what this swap spends, not an unlimited allowance. The previous
+        # value was 2**256 - 1, which makes the blast radius of a compromised or
+        # misconfigured router the entire balance of the token rather than one
+        # trade. The cost is one approval per swap instead of one ever; at a
+        # 200k-gas swap on a sub-gwei chain that is a rounding error against the
+        # exposure it removes.
+        amount_to_approve = required_amount
         nonce = await asyncio.to_thread(w3.eth.get_transaction_count, self.user_address)
-        
+
         tx_params = {
             'from': self.user_address,
             'nonce': nonce,
-            'gasPrice': await asyncio.to_thread(lambda: w3.eth.gas_price),
+            **await self._fee_params(w3),
         }
-        
+
         approve_tx = await asyncio.to_thread(
             token_contract.functions.approve(router_address, amount_to_approve).build_transaction, tx_params
         )
@@ -313,7 +410,12 @@ class UniV3DexClient(DexClient):
         router_contract = w3.eth.contract(address=router_address, abi=self.router_abi)
         nonce = await asyncio.to_thread(w3.eth.get_transaction_count, self.user_address)
 
-        amount_out_minimum = 0 # MUST be derived from the quote and max_slippage_bps before production use
+        # From the caller's floor, which DexSwapParams requires to be positive.
+        # The router enforces it on-chain: the swap reverts rather than filling
+        # at a price a sandwich attack chose.
+        amount_out_minimum = min_amount_out_wei(
+            params.min_amount_out, 0, params.token_out_decimals
+        )
 
         swap_params_struct = {
             'tokenIn': token_in_addr,
@@ -325,11 +427,16 @@ class UniV3DexClient(DexClient):
             'amountOutMinimum': amount_out_minimum,
             'sqrtPriceLimitX96': 0
         }
+        logger.info(
+            f"Swap floor: {params.min_amount_out} token-out units "
+            f"({amount_out_minimum} raw), from a {params.slippage_bps} bps "
+            f"tolerance. The router reverts below this."
+        )
 
         tx_params = {
             'from': self.user_address,
             'nonce': nonce,
-            'gasPrice': await asyncio.to_thread(lambda: w3.eth.gas_price),
+            **await self._fee_params(w3),
         }
         tx_params['gas'] = await asyncio.to_thread(router_contract.functions.exactInputSingle(swap_params_struct).estimate_gas, {'from': self.user_address, 'value': 0})
 

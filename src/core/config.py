@@ -319,26 +319,37 @@ class PlaceboConfig(BaseModel):
     curve would look identical to a real, decaying arbitrage.
 
     The control: evaluate the same CEX book against a DEX quote from
-    `delay_cycles` cycles ago. Under the null -- the edge is a staleness
-    artefact -- the placebo distribution matches the live one. Divergence is the
-    evidence that the edge is real.
+    `delay_seconds` ago. Under the null -- the edge is a staleness artefact --
+    the placebo distribution matches the live one. Divergence is the evidence
+    that the edge is real.
 
     Costs nothing extra: the delayed quote was already fetched.
+
+    THE DELAY MUST EXCEED A BLOCK. The first version of this counted detection
+    cycles: 5 cycles at a 0.2s loop, about a second. Run live against Ethereum it
+    produced 94 paired observations that were IDENTICAL in 69% of cases, median
+    difference 0.00 bps -- which reads as decisive support for the null and is
+    evidence of nothing. A Uniswap v3 quote changes only when a block lands, so
+    inside one 12-second Ethereum block every quote is the same number and the
+    control was comparing a quote to itself.
+
+    `AppConfig.validate_coherence` therefore checks this delay against the block
+    time of the slowest chain in `pairs`, because the failure mode is a control
+    that silently confirms whatever it is pointed at.
     """
 
     enabled: bool = True
 
-    # How many detection cycles to delay the DEX quote by. At the default
-    # loop_interval_seconds of 0.2, 5 cycles is roughly one second -- the same
-    # order as a block time, so the placebo asks "would a one-second-old view
-    # have produced this edge too?"
-    delay_cycles: int = 5
+    # Seconds to delay the DEX quote by. The default spans two Ethereum blocks,
+    # which is the slowest chain this system quotes; on an all-Arbitrum universe
+    # a couple of seconds would do, and the validator will say so.
+    delay_seconds: float = 24.0
 
     @model_validator(mode='after')
     def validate_placebo(self) -> 'PlaceboConfig':
-        if self.enabled and self.delay_cycles < 1:
+        if self.enabled and self.delay_seconds <= 0:
             raise ValueError(
-                "placebo.delay_cycles must be at least 1; a zero delay is the "
+                "placebo.delay_seconds must be positive; a zero delay is the "
                 "live arm, not a control"
             )
         return self
@@ -703,6 +714,28 @@ class AppConfig(BaseModel):
                 f"halt the system, which reads as a malfunction rather than a "
                 f"risk control."
             )
+
+        # The placebo delay must exceed the block time of the slowest chain being
+        # quoted, or the control compares a DEX quote to itself: within one block
+        # every quote is the same number. Measured live, a one-second delay
+        # against Ethereum produced live and placebo values identical in 69% of
+        # paired observations -- a control that confirms whatever it is pointed
+        # at, which is worse than no control at all.
+        if self.strategy.placebo.enabled and self.pairs:
+            from src.strategy.placebo import min_delay_seconds_for
+
+            floor = min_delay_seconds_for(p.dex_chain for p in self.pairs)
+            if self.strategy.placebo.delay_seconds < floor:
+                chains = sorted({p.dex_chain for p in self.pairs})
+                raise ValueError(
+                    f"strategy.placebo.delay_seconds is "
+                    f"{self.strategy.placebo.delay_seconds}, below the "
+                    f"{floor:.1f}s needed to span two blocks on the slowest "
+                    f"configured chain (chains: {chains}). A DEX quote changes "
+                    f"only when a block lands, so a shorter delay compares a "
+                    f"quote to itself and the placebo silently agrees with the "
+                    f"live arm."
+                )
 
         # Every configured pair must be tradeable under the token policy. A
         # hand-written pairs.yaml entry for a fee-on-transfer token would

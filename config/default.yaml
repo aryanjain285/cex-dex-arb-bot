@@ -122,9 +122,18 @@ strategy:
   # the measured edge is a data-staleness artefact, the placebo distribution
   # matches the live one -- so if they do NOT diverge, there is no edge, and you
   # learn that in week one rather than week four. Costs no extra RPC calls.
+  # The delay MUST exceed the block time of the slowest chain being quoted, and
+  # the config validator enforces it. A Uniswap v3 quote changes only when a
+  # block lands, so within one 12-second Ethereum block every quote is the same
+  # number: a shorter delay compares a quote to itself and the placebo silently
+  # agrees with the live arm. Measured on 2026-08-17 with a ~1s delay: 94 paired
+  # observations, identical in 69% of cases, median difference 0.00 bps -- a
+  # control that confirmed whatever it was pointed at.
+  #
+  # 24s is two Ethereum blocks. An all-Arbitrum universe could use ~0.5s.
   placebo:
     enabled: true
-    delay_cycles: 5             # ~1s at a 0.2s loop interval
+    delay_seconds: 24.0
 
   # Which tokens capital may touch.
   #
