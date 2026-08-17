@@ -651,7 +651,13 @@ def survey(
                 typer.echo(f"  {result.cex_symbol:<12} (no measurement: RPC failure)")
             else:
                 flag = ""
-                if result.net_bps > config.strategy.min_net_bps:
+                if result.implausible:
+                    # Beyond any plausible mispricing: almost always a decimals
+                    # error or a ticker matching a different asset than the
+                    # exchange lists. Labelled, not suppressed -- the label is what
+                    # sends someone to check the token.
+                    flag = "  <== IMPLAUSIBLE, check the token identity"
+                elif result.net_bps > config.strategy.min_net_bps:
                     flag = ("  <== ABOVE FLOOR" if result.tradeable
                             else "  <== above floor but NOT TRADEABLE")
                 typer.echo(
@@ -672,6 +678,7 @@ def survey(
     typer.echo("")
     typer.echo(f"measured:               {summary['measured']} of {summary['candidates']}")
     typer.echo(f"RPC failures:           {summary['rpc_failed']}")
+    typer.echo(f"implausible (excluded): {summary['implausible']}")
     typer.echo(f"positive net edge:      {summary['positive']}")
     typer.echo(f"above the {config.strategy.min_net_bps} bps floor:   {summary['above_floor']}")
     typer.secho(

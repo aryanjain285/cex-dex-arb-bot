@@ -30,7 +30,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
-from typing import Dict, Iterable, Mapping, Optional, Sequence, Tuple
+from typing import Dict, Iterable, Mapping, Optional, Sequence, Set, Tuple
 
 __all__ = [
     "TokenRisk",
@@ -41,6 +41,11 @@ __all__ = [
 ]
 
 MODES = ("allowlist", "denylist")
+
+# Chains this system can trade on. Used to reject a typo in a withdraw-network
+# list: "arbitum" would silently make a token look unsettleable on the chain it
+# actually works on -- failing closed, but for a fictional reason.
+KNOWN_CHAINS = ("ethereum", "arbitrum", "base", "bsc", "optimism", "polygon")
 
 
 class TokenPolicyError(ValueError):
@@ -103,6 +108,7 @@ class TokenPolicy:
         mode: str = "allowlist",
         allowed: Optional[Iterable[str]] = None,
         denied: Optional[Mapping[str, Mapping[str, object]]] = None,
+        withdraw_networks: Optional[Mapping[str, Iterable[str]]] = None,
     ):
         if mode not in MODES:
             raise TokenPolicyError(
@@ -122,6 +128,33 @@ class TokenPolicy:
         self.denied: Dict[str, DeniedToken] = {}
         for symbol, spec in (denied or {}).items():
             self.denied[_normalise(symbol)] = self._parse_denied(symbol, spec)
+
+        # Per token, the chains on which the exchange will actually settle it.
+        # A token EXISTING on a chain is not the same as being able to move it
+        # there: the survey found canonical LINK priced 30-53 bps below Binance's
+        # bid on Arbitrum, in pools holding roughly $1.2m, with the price
+        # size-independent. A standing discount on one of the most arbitraged
+        # tokens in existence has an explanation, and the likely one is that
+        # capturing it needs a bridge with its own fee and delay rather than a CEX
+        # withdrawal -- in which case the discount IS that bridge's price, and is
+        # not available to this strategy.
+        #
+        # An absent entry means "not yet established" and does not constrain. An
+        # EMPTY list means somebody looked and found no network, which does.
+        self.withdraw_networks: Dict[str, Optional[Set[str]]] = {}
+        for symbol, chains in (withdraw_networks or {}).items():
+            normalised = set()
+            for chain in chains:
+                lowered = str(chain).strip().lower()
+                if lowered not in KNOWN_CHAINS:
+                    raise TokenPolicyError(
+                        f"token {symbol!r} lists an unknown chain {chain!r}. A "
+                        f"typo here would make the token look unsettleable on the "
+                        f"chain it actually works on. Known: "
+                        f"{', '.join(KNOWN_CHAINS)}."
+                    )
+                normalised.add(lowered)
+            self.withdraw_networks[_normalise(symbol)] = normalised
 
     # ------------------------------------------------------------------
 
@@ -207,6 +240,48 @@ class TokenPolicy:
 
     # ------------------------------------------------------------------
 
+    def check_chain(self, symbol: str, chain: str) -> TokenVerdict:
+        """Whether this token can be traded on THIS chain.
+
+        Runs the ordinary token checks first -- a fee-on-transfer token with
+        perfect settlement is still a fee-on-transfer token, and "nobody has
+        reviewed this" is a more actionable message than "wrong network" for a
+        token nobody has looked at.
+        """
+        verdict = self.check(symbol)
+        if not verdict.allowed:
+            return verdict
+
+        networks = self.withdraw_networks.get(_normalise(symbol))
+        if networks is None:
+            # Not established. Silence is not evidence, and inventing a constraint
+            # from it would block every token before the data is gathered.
+            return TokenVerdict(allowed=True, risks=(), reason="")
+
+        if not networks:
+            return TokenVerdict(
+                allowed=False,
+                risks=(TokenRisk.WITHDRAWAL_SUSPENDED,),
+                reason=(
+                    f"{_normalise(symbol)} has no network on which the exchange "
+                    f"will settle it, so inventory cannot reach or leave any DEX. "
+                    f"Any price advantage is unreachable."
+                ),
+            )
+
+        if str(chain).strip().lower() not in networks:
+            return TokenVerdict(
+                allowed=False,
+                risks=(TokenRisk.WITHDRAWAL_SUSPENDED,),
+                reason=(
+                    f"{_normalise(symbol)} cannot be settled on '{chain}'. The "
+                    f"exchange supports it on: {', '.join(sorted(networks))}. A "
+                    f"price advantage on a chain the inventory cannot reach is "
+                    f"the price of a bridge, not an edge."
+                ),
+            )
+        return TokenVerdict(allowed=True, risks=(), reason="")
+
     def classify(self, *symbols: str) -> str:
         """Mode-independent label for a set of symbols, for the audit trail.
 
@@ -234,15 +309,20 @@ class TokenPolicy:
 
     def describe(self) -> str:
         """One line for the startup log, so the policy in force is on the record."""
+        networks = (
+            f", withdraw networks recorded for {len(self.withdraw_networks)} token(s)"
+            if self.withdraw_networks else
+            ", no withdraw networks recorded (settlement unconstrained)"
+        )
         if self.mode == "allowlist":
             return (
                 f"token policy: allowlist of {len(self.allowed)} "
                 f"({', '.join(sorted(self.allowed))}), "
-                f"{len(self.denied)} explicit denials"
+                f"{len(self.denied)} explicit denials{networks}"
             )
         return (
             f"token policy: DENYLIST mode -- any token not among the "
-            f"{len(self.denied)} listed hazards is permitted"
+            f"{len(self.denied)} listed hazards is permitted{networks}"
         )
 
     def denied_symbols(self) -> Sequence[str]:

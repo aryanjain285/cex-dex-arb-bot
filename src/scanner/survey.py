@@ -85,6 +85,13 @@ WETH_ADDRESSES = {
 DEFAULT_FEE_TIERS = (3000, 500, 10000)
 TEN_THOUSAND = Decimal("10000")
 
+# Beyond this, a "net edge" is a data error rather than a mispricing -- almost
+# always a wrong decimals value or a token whose ticker matches but whose identity
+# does not. A survey of Base returned TURBOUSDT at +4,118,836 bps for exactly that
+# reason. The detector has carried the same guard as `max_net_bps_sanity` since the
+# decimals work; the survey needed it too.
+DEFAULT_MAX_PLAUSIBLE_BPS = Decimal("1000")
+
 
 @dataclass(frozen=True)
 class TokenRegistry:
@@ -151,6 +158,10 @@ class SurveyResult:
     tradeable: bool
     policy_reason: str
     rpc_failed: bool = False
+    # True when the measured edge exceeds any plausible mispricing. The number is
+    # still reported: suppressing it would hide the error instead of labelling it,
+    # and the label is what tells an operator to go and check the token.
+    implausible: bool = False
 
 
 async def evaluate_candidate(
@@ -165,6 +176,7 @@ async def evaluate_candidate(
     fee_tiers: Sequence[int] = DEFAULT_FEE_TIERS,
     cex_legs: int = 2,
     token_policy=None,
+    max_plausible_bps: Decimal = DEFAULT_MAX_PLAUSIBLE_BPS,
 ) -> Optional[SurveyResult]:
     """Best net edge available on one token, across fee tiers and both directions.
 
@@ -249,10 +261,19 @@ async def evaluate_candidate(
         return None
 
     net_bps, gross_bps, fee, direction = best
+    implausible = abs(net_bps) > max_plausible_bps
+    if implausible:
+        logger.warning(
+            f"{candidate.cex_symbol} on {candidate.chain} shows {net_bps:.0f} bps, "
+            f"beyond the {max_plausible_bps} bps plausibility bound. That is "
+            f"almost certainly a decimals error or a ticker that matches a "
+            f"different asset than the exchange lists -- not an opportunity."
+        )
     return SurveyResult(
         cex_symbol=candidate.cex_symbol, chain=candidate.chain, fee=fee,
         direction=direction, net_bps=net_bps, gross_bps=gross_bps,
         tradeable=tradeable, policy_reason=policy_reason, rpc_failed=rpc_failed,
+        implausible=implausible,
     )
 
 
@@ -314,17 +335,23 @@ def summarise(results: Sequence[SurveyResult], floor_bps: Decimal) -> dict:
     have reported an opportunity.
     """
     measured = [r for r in results if r.net_bps is not None]
-    positive = [r for r in measured if r.net_bps > 0]
-    above = [r for r in measured if r.net_bps > floor_bps]
+    credible = [r for r in measured if not r.implausible]
+    positive = [r for r in credible if r.net_bps > 0]
+    above = [r for r in credible if r.net_bps > floor_bps]
     return {
         "candidates": len(results),
         "measured": len(measured),
         "rpc_failed": sum(1 for r in results if r.rpc_failed),
+        "implausible": sum(1 for r in measured if r.implausible),
         "positive": len(positive),
         "above_floor": len(above),
+        # Implausible results are excluded before this count, so the headline
+        # number cannot be inflated by a decimals error -- and does not depend on
+        # the token happening to be off the allowlist, which is what caught the
+        # TURBO case.
         "tradeable_above_floor": len([r for r in above if r.tradeable]),
         "best_gross_bps": (
-            max((r.gross_bps for r in measured), default=None)
+            max((r.gross_bps for r in credible), default=None)
         ),
     }
 

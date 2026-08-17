@@ -233,6 +233,17 @@ class OpportunityDetector:
         # Before any network call. Quoting a token that can never be traded
         # spends rate limit and adds latency to every other pair in the cycle.
         verdict = self._token_policy.check(*self._pair_symbols(pair))
+        if verdict.allowed:
+            # And can the inventory actually reach this chain? A token existing on
+            # a chain is not the same as the exchange settling it there, and a
+            # price advantage on a chain we cannot move to is the price of a
+            # bridge rather than an edge. Checked per symbol, because the base and
+            # the quote can have different network support.
+            for symbol in self._pair_symbols(pair):
+                chain_verdict = self._token_policy.check_chain(symbol, pair.dex_chain)
+                if not chain_verdict.allowed:
+                    verdict = chain_verdict
+                    break
         if not verdict.allowed:
             logger.warning(f"{pair.cex_symbol} blocked by token policy: {verdict.reason}")
             self._emit(pair, _Evaluation(

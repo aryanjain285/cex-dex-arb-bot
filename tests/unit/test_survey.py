@@ -211,6 +211,73 @@ async def test_an_rpc_failure_is_distinguished_from_no_pool():
     )
 
 
+async def test_an_implausible_edge_is_flagged_rather_than_reported():
+    """A survey of Base returned TURBOUSDT at +4,118,836 bps.
+
+    That is not an opportunity; it is a token-identity error. CoinGecko lists
+    exactly one coin with the ticker TURBO on Base, so the ambiguity filter passed
+    it -- but a ticker with a single claimant can still be a DIFFERENT asset from
+    the one Binance lists, and no price check can tell. Unambiguous within
+    CoinGecko is not the same as "the same asset as the CEX".
+
+    The detector has had a `max_net_bps_sanity` guard for exactly this reason: an
+    edge beyond a plausible bound usually means a decimals or identity error, not
+    a mispricing. The survey needs the same guard, or its output includes fantasies
+    that a reader has to recognise unaided.
+    """
+    # A WETH-per-token price 1000x the truth, as a wrong-decimals error produces.
+    dex = StubDex(sell_price="7.36842", buy_price="7.36842")
+
+    result = await evaluate_candidate(
+        _candidate(), dex, eth_bid=D(1900), eth_ask=D(1900),
+        notional=D(1000), taker_fee_bps=D("7.5"), rotation_quote=D(2),
+        fee_tiers=(3000,), max_plausible_bps=D(1000),
+    )
+
+    assert result is not None
+    assert result.implausible is True
+    assert result.net_bps is not None, (
+        "the number is still reported -- suppressing it would hide the error "
+        "rather than label it"
+    )
+
+
+async def test_a_plausible_edge_is_not_flagged():
+    dex = StubDex(sell_price="0.00750000", buy_price="0.00750000")
+
+    result = await evaluate_candidate(
+        _candidate(), dex, eth_bid=D(1900), eth_ask=D(1900),
+        notional=D(1000), taker_fee_bps=D("7.5"), rotation_quote=D(2),
+        fee_tiers=(3000,), max_plausible_bps=D(1000),
+    )
+
+    assert result.implausible is False
+
+
+async def test_an_implausible_result_is_never_counted_as_tradeable():
+    """Belt and braces: the token policy caught the TURBO case, but a survey must
+    not depend on a token happening to be off the allowlist."""
+    from src.scanner.survey import summarise
+
+    dex = StubDex(sell_price="7.36842", buy_price="7.36842")
+    result = await evaluate_candidate(
+        _candidate(base="ARB", cex_symbol="ARBUSDT"), dex,
+        eth_bid=D(1900), eth_ask=D(1900), notional=D(1000),
+        taker_fee_bps=D("7.5"), rotation_quote=D(2), fee_tiers=(3000,),
+        token_policy=load_config().strategy.token_policy.build(),
+        max_plausible_bps=D(1000),
+    )
+
+    assert result.tradeable is True, "ARB is allowlisted"
+    assert result.implausible is True
+
+    summary = summarise([result], floor_bps=D(5))
+    assert summary["tradeable_above_floor"] == 0, (
+        "an implausible number was counted as a tradeable opportunity"
+    )
+    assert summary["implausible"] == 1
+
+
 async def test_every_result_carries_the_token_policy_verdict():
     """The survey's one positive hit was an asset-identity trap. A reader must not
     have to notice that themselves."""

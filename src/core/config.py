@@ -555,6 +555,21 @@ class TokenPolicyConfig(BaseModel):
     # dangerous of the two operations, so the urgent path is the YAML one.
     denied_extra: Dict[str, Dict[str, Any]] = Field(default_factory=dict)
 
+    # Per token, the chains on which the exchange will actually settle it. A token
+    # EXISTING on a chain is not the same as being able to move it there, and the
+    # difference is worth real money: canonical LINK prices 30-53 bps below
+    # Binance's bid on Arbitrum, in deep pools, size-independently. If Binance does
+    # not credit LINK on the Arbitrum network then that discount is the price of a
+    # bridge rather than an edge.
+    #
+    # An absent entry means "not established" and does not constrain -- silence is
+    # not evidence. An explicit EMPTY list means somebody looked and found no
+    # network, which does constrain.
+    #
+    # Populate from the signed endpoint /sapi/v1/capital/config/getall, which lists
+    # withdraw networks per coin. It is not guessable from public data.
+    withdraw_networks: Dict[str, List[str]] = Field(default_factory=dict)
+
     def build(self) -> 'TokenPolicy':
         """Construct the runtime policy, validating the lists as it goes."""
         from src.strategy.token_policy import TokenPolicy
@@ -563,6 +578,7 @@ class TokenPolicyConfig(BaseModel):
             mode=self.mode,
             allowed=self.allowed,
             denied={**self.denied, **self.denied_extra},
+            withdraw_networks=self.withdraw_networks,
         )
 
     @model_validator(mode='after')

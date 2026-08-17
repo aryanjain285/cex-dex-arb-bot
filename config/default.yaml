@@ -192,6 +192,31 @@ strategy:
     #     risks: ["fee_on_transfer"]     # see TokenRisk for the vocabulary
     #     note: "observed 2% on transfer on 2026-08-17; tx 0x..."
 
+    # Per token, the chains on which the EXCHANGE will actually settle it.
+    #
+    # A token existing on a chain is not the same as being able to move it there,
+    # and the difference is worth real money. Measured on 2026-08-17: canonical
+    # bridged LINK prices 30-53 bps BELOW Binance's bid on Arbitrum, in pools
+    # holding roughly $1.2m, and the price barely moves between a $100 and a
+    # $1,000 buy -- so it is not price impact, the pool is genuinely priced there.
+    # A standing discount on one of the most heavily arbitraged tokens in existence
+    # has an explanation, and the likely one is that capturing it requires bridging
+    # LINK off Arbitrum rather than withdrawing it from Binance. In that case the
+    # discount IS the bridge's price and this strategy cannot collect it.
+    #
+    # An absent entry means "not established" and does NOT constrain -- silence is
+    # not evidence. An explicit empty list means somebody looked and found no
+    # network, and that does constrain.
+    #
+    # Populate from the signed endpoint /sapi/v1/capital/config/getall, which lists
+    # withdraw networks per coin. It cannot be guessed from public data, so these
+    # stay empty until someone runs it with keys.
+    withdraw_networks: {}
+    # withdraw_networks:
+    #   LINK: ["ethereum"]          # then a LINK pool on arbitrum is refused
+    #   WETH: ["ethereum", "arbitrum", "base"]
+    #   ARB:  ["arbitrum"]
+
 # CEX settings (testnet)
 # cex:
 #   name: "binance-testnet"
