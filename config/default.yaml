@@ -135,6 +135,33 @@ strategy:
     enabled: true
     delay_seconds: 24.0
 
+  # Which Uniswap v3 fee tier to quote, per pair and per side.
+  #
+  # pairs.yaml names ONE dex_pool_fee per pair, and quoting only that pool is a
+  # standing bet that one tier is always best. Uniswap v3 lists the same asset
+  # pair at up to four tiers with independent liquidity. Measured live on
+  # 2026-08-17 at a 1000 notional:
+  #
+  #   ETH/USDT  configured tier 500 -> 1892.49   tier 100 -> 1893.49   5.3 bps
+  #   ETH/USDC  configured tier 500 -> 1891.05   tier 100 -> 1891.74   3.7 bps
+  #
+  # Against the 5 bps net floor above, the tier choice alone is larger than the
+  # edge being chased.
+  #
+  # QuoterV2's price is already net of the pool fee AND of price impact at the
+  # size quoted, so comparing tiers at the intended size compares executable
+  # prices. The 100 tier is not automatically better -- it is better only when its
+  # liquidity is deep enough at this size, which is what the quote reports.
+  #
+  # Refreshed on a TTL, not per cycle: four tiers on both sides of three pairs at
+  # a 0.2s loop would be 120 RPC calls a second. At 300s it is 24 calls per
+  # interval. Set enabled: false to pin the configured tier -- for a pool that has
+  # been vetted, or to reproduce an earlier run exactly.
+  dex_routing:
+    enabled: true
+    candidate_fee_tiers: [100, 500, 3000, 10000]
+    refresh_seconds: 300.0
+
   # Which tokens capital may touch.
   #
   # Three token properties break this strategy's arithmetic, and none of them is

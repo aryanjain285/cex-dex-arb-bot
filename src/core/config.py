@@ -310,6 +310,61 @@ class ScannerConfig(BaseModel):
     auto_discovery: Optional[AutoDiscoveryConfig] = None
 
 
+class DexRoutingConfig(BaseModel):
+    """Which Uniswap v3 fee tier to quote for a pair.
+
+    `pairs.yaml` names one `dex_pool_fee` per pair, and the detector quoted only
+    that pool. Uniswap v3 lists the same asset pair at up to four fee tiers with
+    independent liquidity, so a static choice is a standing bet that one tier is
+    always best. Measured live at a 1000 notional on 2026-08-17:
+
+        ETH/USDT  configured tier 500 -> 1892.49   tier 100 -> 1893.49  (5.3 bps)
+        ETH/USDC  configured tier 500 -> 1891.05   tier 100 -> 1891.74  (3.7 bps)
+
+    Against a 5 bps net floor the tier choice alone exceeds the edge being chased.
+
+    Selection is refreshed on a TTL rather than per cycle: four tiers on both
+    sides of three pairs at a 0.2s loop would be 120 RPC calls a second.
+    """
+
+    enabled: bool = True
+
+    # The four tiers Uniswap v3 deploys by default. 100 (0.01%) exists mainly for
+    # stable and correlated pairs, and is where the measured ETH improvement was.
+    candidate_fee_tiers: List[int] = Field(
+        default_factory=lambda: [100, 500, 3000, 10000]
+    )
+
+    # How long a selection stands. Liquidity migrates between tiers over hours,
+    # not seconds, so five minutes is frequent enough to follow it and rare
+    # enough that the extra RPC cost is negligible: 24 calls per interval against
+    # 30 per second in the hot loop.
+    refresh_seconds: float = 300.0
+
+    @model_validator(mode='after')
+    def validate_routing(self) -> 'DexRoutingConfig':
+        if self.enabled and not self.candidate_fee_tiers:
+            raise ValueError(
+                "dex_routing.candidate_fee_tiers is empty while routing is "
+                "enabled; there would be nothing to choose between"
+            )
+        for fee in self.candidate_fee_tiers:
+            if fee <= 0:
+                raise ValueError(f"fee tier {fee} must be positive")
+        if len(set(self.candidate_fee_tiers)) != len(self.candidate_fee_tiers):
+            raise ValueError(
+                f"dex_routing.candidate_fee_tiers contains duplicates: "
+                f"{self.candidate_fee_tiers}. Each duplicate costs a quote and "
+                f"changes nothing."
+            )
+        if self.enabled and self.refresh_seconds <= 0:
+            raise ValueError(
+                "dex_routing.refresh_seconds must be positive; zero would "
+                "re-quote every tier on every detection cycle"
+            )
+        return self
+
+
 class PlaceboConfig(BaseModel):
     """A control arm for the edge measurement.
 
@@ -583,6 +638,10 @@ class StrategyConfig(BaseModel):
     # configured pairs and again in the detector for anything discovered
     # at runtime.
     token_policy: TokenPolicyConfig = Field(default_factory=TokenPolicyConfig)
+
+    # Which Uniswap v3 fee tier to quote per pair and side, measured rather
+    # than assumed.
+    dex_routing: DexRoutingConfig = Field(default_factory=DexRoutingConfig)
 
     @model_validator(mode='after')
     def validate_strategy(self) -> 'StrategyConfig':

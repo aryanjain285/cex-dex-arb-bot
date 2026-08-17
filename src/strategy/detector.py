@@ -37,6 +37,7 @@ from src.exchange.dex_base import DexClient
 from src.infra.evaluation_store import EvaluationRecord
 from src.infra import metrics
 from src.infra.metrics import opportunities_found
+from src.exchange.pool_selector import PoolSelector
 from src.strategy.placebo import DelayedQuoteBuffer
 from src.strategy.costs import (
     BookFill,
@@ -93,6 +94,10 @@ class _Evaluation:
     depth_levels_used: Optional[int] = None
     book_age_s: Optional[float] = None
     placebo_net_bps: Optional[Decimal] = None
+    # The fee tier actually quoted. Recorded rather than taken from the
+    # pair, because with routing enabled they differ -- and a row that names
+    # a pool the price did not come from cannot be re-derived.
+    dex_pool_fee_used: Optional[int] = None
 
 
 class OpportunityDetector:
@@ -119,6 +124,14 @@ class OpportunityDetector:
         # Built once. Constructing it per evaluation would put a validation
         # error in the hot loop, where the only safe response is to keep going.
         self._token_policy = strategy_config.token_policy.build()
+
+        routing = strategy_config.dex_routing
+        self._pool_selector = (
+            PoolSelector(
+                dex_client, routing.candidate_fee_tiers, routing.refresh_seconds
+            )
+            if routing.enabled else None
+        )
         logger.info(
             f"Opportunity detector initialised, monitoring {len(pairs)} pairs "
             f"({'recording' if store else 'NOT recording'} evaluations)."
@@ -286,6 +299,22 @@ class OpportunityDetector:
     # direct pairs
     # ------------------------------------------------------------------
 
+    async def _quoting_pair(
+        self, pair: MarketPair, side: str, size: Decimal
+    ) -> MarketPair:
+        """The pair as it should be quoted, with the best fee tier substituted.
+
+        Returns the pair unchanged when routing is disabled or the selector has
+        nothing better to offer, so the configured tier remains the fallback in
+        every failure path.
+        """
+        if self._pool_selector is None:
+            return pair
+        fee = await self._pool_selector.best_fee(pair, side=side, size=size)
+        if fee == pair.dex_pool_fee:
+            return pair
+        return pair.model_copy(update={"dex_pool_fee": fee})
+
     async def _evaluate_direct(self, pair: MarketPair) -> List[_Evaluation]:
         book, reason = await self._usable_book(pair)
         if book is None:
@@ -313,6 +342,13 @@ class OpportunityDetector:
             book_age_s=book.age_seconds(clock.now()),
         )
 
+        # The DEX leg sells base, so ask the selector which pool sells best at
+        # this size. Falls back to the configured tier on any failure.
+        quoting_pair = await self._quoting_pair(
+            pair, side="sell", size=notional / book.best_ask
+        )
+        ev.dex_pool_fee_used = quoting_pair.dex_pool_fee
+
         # Size from top of book, then price that size by walking the ladder.
         # The resulting VWAP is never better than best_ask.
         size_base = notional / book.best_ask
@@ -327,7 +363,7 @@ class OpportunityDetector:
             return ev
 
         quote = await self.dex_client.get_quote(
-            pair, size=fill.filled_base, side="sell", estimate_gas=True
+            quoting_pair, size=fill.filled_base, side="sell", estimate_gas=True
         )
         if quote is None or quote.price <= ZERO:
             ev.reason = RejectionReason.NO_DEX_QUOTE
@@ -366,12 +402,19 @@ class OpportunityDetector:
             book_age_s=book.age_seconds(clock.now()),
         )
 
+        # The DEX leg buys base with quote units, so the better pool is the one
+        # that charges less per base.
+        quoting_pair = await self._quoting_pair(
+            pair, side="buy", size=notional if dex_spend is None else dex_spend
+        )
+        ev.dex_pool_fee_used = quoting_pair.dex_pool_fee
+
         # `side="buy"` consumes an amount of the DEX quote token, not a base
         # amount. For a direct pair that is the target notional; for a
         # synthetic pair the caller converts it into the intermediate asset.
         spend = notional if dex_spend is None else dex_spend
         quote = await self.dex_client.get_quote(
-            pair, size=spend, side="buy", estimate_gas=True
+            quoting_pair, size=spend, side="buy", estimate_gas=True
         )
         if quote is None or quote.price <= ZERO:
             ev.reason = RejectionReason.NO_DEX_QUOTE
@@ -592,7 +635,7 @@ class OpportunityDetector:
             return None
 
         opportunities_found.labels(pair=pair.cex_symbol, direction=best.direction).inc()
-        return self._to_opportunity(pair, best.econ)
+        return self._to_opportunity(pair, best.econ, best.dex_pool_fee_used)
 
     def _emit(
         self, pair: MarketPair, ev: _Evaluation,
@@ -643,7 +686,13 @@ class OpportunityDetector:
                 base=pair.base,
                 quote_cex=pair.quote_cex,
                 dex_chain=pair.dex_chain,
-                dex_pool_fee=pair.dex_pool_fee,
+                # The tier actually quoted, which differs from the configured
+                # one whenever routing found a better pool. A row naming a
+                # pool the price did not come from cannot be re-derived.
+                dex_pool_fee=(
+                    ev.dex_pool_fee_used
+                    if ev.dex_pool_fee_used is not None else pair.dex_pool_fee
+                ),
                 is_synthetic=pair.is_synthetic,
                 outcome="taken" if taken else "rejected",
                 direction=ev.direction or None,
@@ -671,7 +720,19 @@ class OpportunityDetector:
         except Exception as exc:
             logger.error(f"Failed to record evaluation for {pair.cex_symbol}: {exc}")
 
-    def _to_opportunity(self, pair: MarketPair, econ: TradeEconomics) -> Opportunity:
+    def _to_opportunity(
+        self,
+        pair: MarketPair,
+        econ: TradeEconomics,
+        dex_pool_fee_used: Optional[int] = None,
+    ) -> Opportunity:
+        # The pair carried on the opportunity must name the pool the price came
+        # from. The executor builds the swap from this object, so a mismatch would
+        # send the trade to a different pool than the one that was quoted -- and
+        # with routing enabled the configured tier is frequently not the one used.
+        if dex_pool_fee_used is not None and dex_pool_fee_used != pair.dex_pool_fee:
+            pair = pair.model_copy(update={"dex_pool_fee": dex_pool_fee_used})
+
         return Opportunity(
             pair=pair,
             direction=econ.direction,
