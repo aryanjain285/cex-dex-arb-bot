@@ -329,6 +329,157 @@ def backtest(dataset_path: str = typer.Option(..., "--dataset-path", help="Path 
 
 
 @app.command()
+def analyse(
+    database: Optional[str] = typer.Option(
+        None, "--database",
+        help="Evaluation store to read; defaults to the configured path",
+    ),
+    run_id: Optional[str] = typer.Option(
+        None, "--run-id", help="Only this run; defaults to the most recent"
+    ),
+    include_untradeable: bool = typer.Option(
+        False, "--include-untradeable",
+        help="Include tokens the policy would refuse (a denylist-mode measurement)",
+    ),
+):
+    """Read the audit trail and answer the questions it exists to answer.
+
+    Is there an edge, and how big? Is it an edge or a staleness artefact? Where
+    does the money go? Is the flow one-directional, so is the rotation charge real?
+    Is the market quiet, or is the bot broken?
+
+    Every figure comes from rows the run wrote itself. Nothing is re-derived from
+    live venues, so this is reproducible after the fact and cheap to run often.
+    """
+    import sqlite3
+    from decimal import Decimal
+    from pathlib import Path
+
+    from src.infra.analysis import (
+        cost_decomposition, direction_balance, edge_distribution,
+        placebo_comparison, rejection_reasons,
+    )
+    from src.infra.evaluation_store import EvaluationStore
+
+    config = load_config()
+    path = Path(database or config.observability.evaluation_store_path)
+    if not path.exists():
+        typer.secho(
+            f"No evaluation store at {path}. Run `paper` first -- the dataset is "
+            f"written by the run.", fg=typer.colors.RED,
+        )
+        raise typer.Exit(code=1)
+
+    # Read-only: opening through EvaluationStore would migrate the schema, which
+    # an analysis command has no business doing to someone's dataset.
+    connection = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    connection.row_factory = sqlite3.Row
+
+    runs = connection.execute(
+        "SELECT run_id, COUNT(*) n, MIN(ts) a, MAX(ts) b FROM evaluations "
+        "GROUP BY run_id ORDER BY b DESC"
+    ).fetchall()
+    if not runs:
+        typer.echo("The store is empty.")
+        raise typer.Exit(code=0)
+
+    typer.echo(f"runs in {path}:")
+    for row in runs:
+        typer.echo(
+            f"  {row['run_id']}  rows={row['n']:<6} "
+            f"span={row['b'] - row['a']:.0f}s"
+        )
+    chosen = run_id or runs[0]["run_id"]
+    typer.secho(f"\nanalysing {chosen}\n", bold=True)
+
+    class _View:
+        """Just enough of the store's read surface for the analysis functions."""
+
+        def all_rows(self):
+            return [
+                dict(r) for r in connection.execute(
+                    "SELECT * FROM evaluations WHERE run_id = ? ORDER BY id",
+                    (chosen,),
+                )
+            ]
+
+    view = _View()
+    tradeable_only = not include_untradeable
+
+    typer.secho("REJECTION REASONS", bold=True)
+    for reason, count in rejection_reasons(view).items():
+        typer.echo(f"  {reason:<24} {count}")
+
+    typer.secho("\nNET EDGE, bps", bold=True)
+    rows = edge_distribution(view, tradeable_only=tradeable_only)
+    if not rows:
+        typer.echo("  no evaluation reached the economics")
+    for row in rows:
+        typer.echo(
+            f"  {row['cex_symbol']:<12} {row['direction']:<11} "
+            f"n={row['count']:<5} median {float(row['median_bps']):>9.2f}  "
+            f"p10 {float(row['p10_bps']):>9.2f}  p90 {float(row['p90_bps']):>9.2f}  "
+            f"best {float(row['best_bps']):>9.2f}"
+        )
+
+    typer.secho("\nPLACEBO ARM", bold=True)
+    placebo = placebo_comparison(view, tradeable_only=tradeable_only)
+    if placebo["paired"]:
+        typer.echo(
+            f"  paired {placebo['paired']}   "
+            f"live median {float(placebo['live_median_bps']):.2f}   "
+            f"placebo median {float(placebo['placebo_median_bps']):.2f}"
+        )
+        typer.echo(
+            f"  difference: median {float(placebo['median_difference_bps']):+.2f}  "
+            f"p10 {float(placebo['p10_difference_bps']):+.2f}  "
+            f"p90 {float(placebo['p90_difference_bps']):+.2f}"
+        )
+    typer.echo(f"  {placebo['verdict']}")
+
+    typer.secho("\nCOST DECOMPOSITION, bps of notional", bold=True)
+    # Per pair, not combined: gas differs by chain and one dislocated pair drags a
+    # combined gross into describing no pair that exists.
+    per_pair = cost_decomposition(view, tradeable_only=tradeable_only, by_pair=True)
+    if not per_pair:
+        typer.echo("  no priced rows")
+    for symbol, costs in per_pair.items():
+        if not costs.get("rows"):
+            continue
+        typer.echo(
+            f"  {symbol}  ({costs['rows']} rows at a "
+            f"{float(costs['notional_quote']):.0f} notional)"
+        )
+        typer.echo(f"      gross          {float(costs['gross_bps']):>9.2f}")
+        typer.echo(f"      cex taker fee  {float(costs['cex_fee_bps']):>9.2f}")
+        typer.echo(f"      gas            {float(costs['gas_bps']):>9.2f}")
+        typer.echo(f"      rotation       {float(costs['rotation_bps']):>9.2f}")
+        typer.echo(f"      total cost     {float(costs['total_cost_bps']):>9.2f}")
+        typer.echo(f"      net            {float(costs['net_bps']):>9.2f}")
+        typer.secho(f"      largest cost:  {costs['largest_cost']}",
+                    fg=typer.colors.YELLOW)
+
+    typer.secho("\nDIRECTION BALANCE  (does rotation cost apply?)", bold=True)
+    balance = direction_balance(view, tradeable_only=tradeable_only)
+    if not balance:
+        typer.echo("  no paired cycles")
+    for row in balance:
+        typer.echo(
+            f"  {row['cex_symbol']:<12} cycles={row['cycles']:<5} "
+            f"CEX_to_DEX {row['cex_to_dex_better']:>4}  "
+            f"DEX_to_CEX {row['dex_to_cex_better']:>4}  "
+            f"imbalance {float(row['imbalance']):.2f}"
+        )
+    if balance:
+        typer.echo(
+            "  imbalance 0 means the flow self-balances and rotation is rare; 1 "
+            "means inventory strands every time and the full charge applies."
+        )
+
+    connection.close()
+
+
+@app.command()
 def survey(
     chain: str = typer.Option("ethereum", "--chain", help="Chain to survey"),
     limit: int = typer.Option(40, "--limit", help="How many tokens, most prominent first"),
