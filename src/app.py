@@ -16,6 +16,7 @@ from .infra.logging import setup_logging
 from .infra.metrics import setup_metrics
 from .infra.dashboard import DashboardPublisher
 from .infra.evaluation_store import EvaluationStore
+from .scanner.dataset import DatasetError, require_decimals
 from .infra.lifecycle import ShutdownSignal, drain, install_signal_handlers
 from .infra import metrics
 from .exchange.binance import BinanceCexClient
@@ -142,6 +143,7 @@ class ArbiBotApp:
             opportunities = data.get("opportunities", [])
             self.logger.info(f"Loaded {len(opportunities)} dynamic opportunities from {discovery_path}.")
 
+            skipped = 0
             for opp in opportunities:
                 if not opp.get("dex_candidates"):
                     continue
@@ -167,18 +169,44 @@ class ArbiBotApp:
                 is_synthetic = raw_pool.get('is_synthetic', False)
                 intermediate_symbol = raw_pool.get('intermediate_symbol') if is_synthetic else None
 
-                # For synthetic pairs, decimals MUST come from the raw pool data to match the on-chain addresses.
-                if is_synthetic:
-                    base_decimals = base_details_raw.get('decimals', 18)
-                    quote_decimals = quote_details_raw.get('decimals', 18) # This is the intermediate token's decimals
-                    quote_dex = intermediate_symbol
-                else:
-                    # For direct pairs, we can use the authoritative lookup.
-                    base_token_config = config.tokens.get(opp["base"], {}).get(candidate["chain"])
-                    quote_token_config = config.tokens.get(opp["quote"], {}).get(candidate["chain"])
-                    base_decimals = base_token_config.decimals if base_token_config else base_details_raw.get('decimals', 18)
-                    quote_decimals = quote_token_config.decimals if quote_token_config else quote_details_raw.get('decimals', 18)
-                    quote_dex = opp["quote"]
+                # Token decimals are resolved here, and a missing value is a
+                # hard error rather than a default of 18. On a 6-decimal token
+                # that default is a 10^12 pricing error, and the shipped pool
+                # dataset carries no decimals field at all.
+                #
+                # The failure is scoped to one pair: a single unusable entry
+                # must not take down the whole dynamic pair set, but it must be
+                # loudly summarised rather than silently priced.
+                context = f"auto_discovery {opp['symbol']}"
+                base_decimals = quote_decimals = None
+                quote_dex = None
+                try:
+                    if is_synthetic:
+                        # For synthetic pairs the decimals MUST come from the
+                        # pool data, to match the on-chain addresses quoted.
+                        base_decimals = require_decimals(base_details_raw, context)
+                        quote_decimals = require_decimals(quote_details_raw, context)
+                        quote_dex = intermediate_symbol
+                    else:
+                        # For direct pairs tokens.yaml is authoritative, falling
+                        # back to pool data -- which must still carry decimals.
+                        base_token_config = config.tokens.get(opp["base"], {}).get(candidate["chain"])
+                        quote_token_config = config.tokens.get(opp["quote"], {}).get(candidate["chain"])
+                        base_decimals = (
+                            base_token_config.decimals if base_token_config
+                            else require_decimals(base_details_raw, context)
+                        )
+                        quote_decimals = (
+                            quote_token_config.decimals if quote_token_config
+                            else require_decimals(quote_details_raw, context)
+                        )
+                        quote_dex = opp["quote"]
+                except DatasetError as exc:
+                    self.logger.warning(f"Skipping {opp['symbol']}: {exc}")
+
+                if base_decimals is None or quote_decimals is None or quote_dex is None:
+                    skipped += 1
+                    continue
 
                 # Load default strategy params from config for dynamic pairs
                 default_params = config.scanner.volume.default_pair_params
@@ -205,6 +233,15 @@ class ArbiBotApp:
                     max_edge_bps=default_params.get("max_edge_bps"),
                 )
                 discovered_pairs.append(pair)
+
+            if skipped:
+                self.logger.error(
+                    f"Skipped {skipped} discovered pair(s) with unusable token "
+                    f"decimals. Regenerate data/target_pools_Dex.json -- the "
+                    f"shipped snapshot predates the decimals field, and "
+                    f"defaulting it to 18 is a 10^12 pricing error on any "
+                    f"6-decimal token."
+                )
             return discovered_pairs
         except Exception as e:
             self.logger.error(f"Error reading or parsing {discovery_path}: {e}", exc_info=True)

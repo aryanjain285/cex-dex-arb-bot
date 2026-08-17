@@ -13,6 +13,7 @@ from loguru import logger
 from src.core.config import AppConfig, load_config
 from src.core.types import MarketPair
 from src.exchange.univ3 import UniV3DexClient
+from src.scanner.dataset import DatasetError, require_decimals
 
 # --- Constants ---
 TARGET_QUOTE_CURRENCIES = ["USDT", "USDC"]
@@ -131,6 +132,15 @@ class BinancePublicClient:
             return None
 
 # --- Core Logic ---
+
+def _pool_ctx(pool: Dict[str, Any]) -> str:
+    """Identify a pool in an error message so the failure is actionable."""
+    return (
+        f"pool {pool.get('poolAddress', '?')} on {pool.get('chain', '?')} "
+        f"({pool.get('token0', {}).get('symbol', '?')}/"
+        f"{pool.get('token1', {}).get('symbol', '?')})"
+    )
+
 
 def _normalize_dex_symbol(symbol: str) -> str:
     normalized_symbol = symbol.upper().split('.')[0]
@@ -323,7 +333,7 @@ class AutoDiscoveryEngine:
                             logger.warning(f"Failed to fetch any valid intermediate price for {intermediate_symbol} against stablecoins.")
                             continue
                         
-                        pair_dex = MarketPair(base=_normalize_dex_symbol(base_token_details['symbol']), quote_cex=spike.quote, quote_dex=intermediate_symbol, cex_symbol=f"{base_token_details['symbol']}/{intermediate_symbol}", dex_chain=dex_pool["chain"], dex_pool_fee=dex_pool["feeTier"], base_address=base_token_details['address'], quote_address=intermediate_token_details['address'], base_decimals=base_token_details.get('decimals', 18), quote_decimals=intermediate_token_details.get('decimals', 18))
+                        pair_dex = MarketPair(base=_normalize_dex_symbol(base_token_details['symbol']), quote_cex=spike.quote, quote_dex=intermediate_symbol, cex_symbol=f"{base_token_details['symbol']}/{intermediate_symbol}", dex_chain=dex_pool["chain"], dex_pool_fee=dex_pool["feeTier"], base_address=base_token_details['address'], quote_address=intermediate_token_details['address'], base_decimals=require_decimals(base_token_details, _pool_ctx(dex_pool)), quote_decimals=require_decimals(intermediate_token_details, _pool_ctx(dex_pool)))
                         probe_size = Decimal(str(self.scanner_config.arbitrage.probe_size_base))
                         quote_dex = await self.dex_client.get_quote(pair_dex, probe_size, side="sell")
                         if not quote_dex or not quote_dex.price > 0: continue
@@ -334,7 +344,7 @@ class AutoDiscoveryEngine:
                         else:
                             quote_token_details, base_token_details = token1, token0
 
-                        pair_direct = MarketPair(base=_normalize_dex_symbol(base_token_details['symbol']), quote_cex=_normalize_dex_symbol(quote_token_details['symbol']), quote_dex=_normalize_dex_symbol(quote_token_details['symbol']), cex_symbol=f"{spike.base}/{spike.quote}", dex_chain=dex_pool["chain"], dex_pool_fee=dex_pool["feeTier"], base_address=base_token_details['address'], quote_address=quote_token_details['address'], base_decimals=base_token_details.get('decimals', 18), quote_decimals=quote_token_details.get('decimals', 18))
+                        pair_direct = MarketPair(base=_normalize_dex_symbol(base_token_details['symbol']), quote_cex=_normalize_dex_symbol(quote_token_details['symbol']), quote_dex=_normalize_dex_symbol(quote_token_details['symbol']), cex_symbol=f"{spike.base}/{spike.quote}", dex_chain=dex_pool["chain"], dex_pool_fee=dex_pool["feeTier"], base_address=base_token_details['address'], quote_address=quote_token_details['address'], base_decimals=require_decimals(base_token_details, _pool_ctx(dex_pool)), quote_decimals=require_decimals(quote_token_details, _pool_ctx(dex_pool)))
                         probe_size = Decimal(str(self.scanner_config.arbitrage.probe_size_base))
                         quote_direct = await self.dex_client.get_quote(pair_direct, probe_size, side="sell")
                         if not quote_direct or not quote_direct.price > 0: continue
