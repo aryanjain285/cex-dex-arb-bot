@@ -20,6 +20,7 @@ from backtest.datasets import load_dataset
 from backtest.simulator import Simulator
 from src.strategy.rebalancer import Rebalancer
 from src.exchange.binance import BinanceCexClient
+from src.exchange.rate_limit import get_shared_governor
 from src.scanner import VolumeScannerService, VolumeSpikeScanner, SpikeArbitrageEvaluator
 from src.scanner.autodiscovery import AutoDiscoveryEngine
 
@@ -117,7 +118,13 @@ def rebalance(paper_run: bool = typer.Option(False, "--paper-run", help="Run in 
             base_precision=p.base_precision if p.base_precision is not None else 8,
             quote_precision=p.quote_precision if p.quote_precision is not None else 8,
         ) for p in config.pairs]
-        cex_client = BinanceCexClient(config.cex, config.secrets, pairs)
+        cex_client = BinanceCexClient(
+            config.cex, config.secrets, pairs,
+            governor=get_shared_governor(
+                config.cex.max_request_weight_per_minute,
+                config.cex.request_weight_safety_fraction,
+            ),
+        )
         await cex_client.connect()
         
         rebalancer = Rebalancer(config, cex_client)

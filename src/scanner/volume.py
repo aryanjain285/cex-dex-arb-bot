@@ -13,6 +13,9 @@ import yaml
 from loguru import logger
 
 from src.core.config import AppConfig, PairConfig, VolumeScannerConfig
+from src.exchange.rate_limit import (
+    IpBannedError, WeightGovernor, get_shared_governor, governed_request,
+)
 from src.exchange.univ3 import UniV3DexClient
 
 
@@ -96,18 +99,27 @@ class ValidatedPair:
 class BinanceDataSource:
     """Lightweight REST client for Binance public endpoints."""
 
-    def __init__(self, base_url: str, lookback_hours: int):
+    def __init__(
+        self,
+        base_url: str,
+        lookback_hours: int,
+        governor: Optional[WeightGovernor] = None,
+    ):
         self.base_url = base_url.rstrip("/")
         self.lookback_hours = lookback_hours
+        # The semaphore bounds how many requests are in flight; the governor
+        # bounds the WEIGHT they cost. The exchange limits the latter, per IP, so
+        # only the governor can prevent the 418 ban that would also kill the
+        # market-data WebSocket.
         self._semaphore = asyncio.Semaphore(5)
+        self.governor = governor or WeightGovernor()
 
     async def fetch_exchange_info(self, session: aiohttp.ClientSession) -> List[SymbolInfo]:
         url = f"{self.base_url}/api/v3/exchangeInfo"
-        async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as response:
-            if response.status != 200:
-                text = await response.text()
-                raise RuntimeError(f"Failed to fetch exchangeInfo [{response.status}]: {text}")
-            data = await response.json()
+        data = await governed_request(
+            session, self.governor, "GET", url,
+            timeout=aiohttp.ClientTimeout(total=10),
+        )
         symbols = data.get("symbols", [])
         return [SymbolInfo.from_exchange_info(item) for item in symbols]
 
@@ -119,12 +131,17 @@ class BinanceDataSource:
         }
         url = f"{self.base_url}/api/v3/klines"
         async with self._semaphore:
-            async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=10)) as response:
-                if response.status != 200:
-                    text = await response.text()
-                    logger.warning(f"Failed to fetch klines for {symbol.symbol} [{response.status}]: {text}")
-                    return []
-                return await response.json()
+            try:
+                return await governed_request(
+                    session, self.governor, "GET", url, params=params,
+                    timeout=aiohttp.ClientTimeout(total=10),
+                )
+            except IpBannedError:
+                # Fatal: stop the scan rather than extend the ban.
+                raise
+            except Exception as exc:
+                logger.warning(f"Failed to fetch klines for {symbol.symbol}: {exc}")
+                return []
 
 
 class DiscoveredPairStore:
@@ -152,7 +169,13 @@ class VolumeScannerService:
     def __init__(self, config: AppConfig):
         self.config = config
         self.volume_cfg: VolumeScannerConfig = config.scanner.volume
-        self.datasource = BinanceDataSource(config.cex.base_url, self.volume_cfg.lookback_hours)
+        self.datasource = BinanceDataSource(
+            config.cex.base_url, self.volume_cfg.lookback_hours,
+            governor=get_shared_governor(
+                config.cex.max_request_weight_per_minute,
+                config.cex.request_weight_safety_fraction,
+            ),
+        )
         self.store = DiscoveredPairStore(Path(self.volume_cfg.persist_path))
 
     async def run(self) -> List[ValidatedPair]:

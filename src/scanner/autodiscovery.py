@@ -13,6 +13,9 @@ from loguru import logger
 from src.core.config import AppConfig, load_config
 from src.core.types import MarketPair
 from src.exchange.univ3 import UniV3DexClient
+from src.exchange.rate_limit import (
+    IpBannedError, WeightGovernor, get_shared_governor, governed_request,
+)
 from src.scanner.dataset import DatasetError, require_decimals
 
 # --- Constants ---
@@ -87,19 +90,31 @@ class ArbitrageOpportunity:
 # --- CEX Client ---
 
 class BinancePublicClient:
-    def __init__(self, base_url: str, session: aiohttp.ClientSession, concurrency: int = 20):
+    def __init__(
+        self,
+        base_url: str,
+        session: aiohttp.ClientSession,
+        concurrency: int = 20,
+        governor: Optional[WeightGovernor] = None,
+    ):
         self.base_url = base_url.rstrip("/")
         self.session = session
         self.semaphore = asyncio.Semaphore(concurrency)
+        self.governor = governor or WeightGovernor()
 
     async def fetch_exchange_info(self) -> List[SymbolSnapshot]:
         url = f"{self.base_url}/api/v3/exchangeInfo"
         try:
-            async with aiohttp.ClientSession() as temp_session:
-                async with temp_session.get(url, timeout=10) as response:
-                    response.raise_for_status()
-                    data = await response.json()
+            # Uses the shared session rather than opening a private one. A
+            # temporary session was not the problem in itself -- the problem was
+            # that a request through it was invisible to any budget, and this
+            # endpoint costs weight 20.
+            data = await governed_request(
+                self.session, self.governor, "GET", url, timeout=10
+            )
             return [SymbolSnapshot.from_exchange(item) for item in data.get("symbols", [])]
+        except IpBannedError:
+            raise
         except Exception as e:
             logger.error(f"Failed to fetch exchange info: {e}")
             return []
@@ -108,11 +123,12 @@ class BinancePublicClient:
         params = {"symbol": symbol, "interval": "1h", "limit": limit}
         try:
             async with self.semaphore:
-                async with self.session.get(f"{self.base_url}/api/v3/klines", params=params, timeout=10) as response:
-                    if response.status != 200:
-                        logger.warning(f"Failed to get klines for {symbol} [{response.status}]")
-                        return []
-                    return await response.json()
+                return await governed_request(
+                    self.session, self.governor, "GET",
+                    f"{self.base_url}/api/v3/klines", params=params, timeout=10,
+                )
+        except IpBannedError:
+            raise
         except Exception as e:
             logger.error(f"Error fetching klines for {symbol}: {e}")
             return []
@@ -121,12 +137,12 @@ class BinancePublicClient:
         params = {"symbol": symbol}
         try:
             async with self.semaphore:
-                async with self.session.get(f"{self.base_url}/api/v3/ticker/price", params=params, timeout=10) as response:
-                    if response.status != 200:
-                        logger.warning(f"Failed to get ticker price for {symbol} [{response.status}]")
-                        return None
-                    data = await response.json()
-                    return float(data.get("price"))
+                data = await governed_request(
+                    self.session, self.governor, "GET",
+                    f"{self.base_url}/api/v3/ticker/price", params=params,
+                    timeout=10,
+                )
+                return float(data.get("price"))
         except Exception as e:
             logger.error(f"Error fetching ticker price for {symbol}: {e}")
             return None
@@ -247,7 +263,14 @@ class AutoDiscoveryEngine:
         logger.info(f"Sample CEX-to-DEX map keys (first five): {list(self._cex_to_dex_map.keys())[:5]}")
 
         async with aiohttp.ClientSession() as session:
-            self.cex_client = BinancePublicClient(self.config.cex.base_url, session, self.scanner_config.concurrency)
+            self.cex_client = BinancePublicClient(
+                self.config.cex.base_url, session,
+                self.scanner_config.concurrency,
+                governor=get_shared_governor(
+                    self.config.cex.max_request_weight_per_minute,
+                    self.config.cex.request_weight_safety_fraction,
+                ),
+            )
             spiked_symbols = await self._scan_cex_for_spikes()
             logger.info(f"Anomalous CEX symbols: {[s.symbol for s in spiked_symbols]}")
             opportunities = await self._evaluate_opportunities(spiked_symbols)

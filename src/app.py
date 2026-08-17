@@ -20,6 +20,7 @@ from .scanner.dataset import DatasetError, require_decimals
 from .infra.lifecycle import ShutdownSignal, drain, install_signal_handlers
 from .infra import metrics
 from .exchange.binance import BinanceCexClient
+from .exchange.rate_limit import get_shared_governor
 from .exchange.univ3 import UniV3DexClient
 from .strategy.detector import OpportunityDetector
 from .strategy.router import SimpleRouter
@@ -192,7 +193,17 @@ class ArbiBotApp:
                 config.dashboard.redis_url,
                 config.dashboard.channel,
             )
-        self.cex_client = BinanceCexClient(config.cex, config.secrets, pairs, dashboard_publisher=self.dashboard_publisher)
+        # One governor for the process: the exchange's weight limit is per
+        # IP, so private per-client budgets can sum past the real ceiling
+        # while each client believes it stayed inside its allowance.
+        self.cex_client = BinanceCexClient(
+            config.cex, config.secrets, pairs,
+            dashboard_publisher=self.dashboard_publisher,
+            governor=get_shared_governor(
+                config.cex.max_request_weight_per_minute,
+                config.cex.request_weight_safety_fraction,
+            ),
+        )
         self.dex_client = UniV3DexClient(config.dex, config.network, config.secrets, config.tokens)
         # Per-mode state: paper PnL must never enter the live daily loss
         # budget. See risk_state_path_for_mode.

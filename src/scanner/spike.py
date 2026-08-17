@@ -15,6 +15,9 @@ from loguru import logger
 from src.core.config import AppConfig, VolumeSpikeConfig
 from src.core.types import MarketPair
 from src.exchange.univ3 import UniV3DexClient
+from src.exchange.rate_limit import (
+    IpBannedError, RateLimitedError, WeightGovernor, get_shared_governor, governed_request,
+)
 from src.strategy.costs import evaluate_trade
 
 
@@ -117,38 +120,67 @@ class VolumeSpikeStore:
 
 
 class BinancePublicClient:
-    def __init__(self, base_url: str, session: aiohttp.ClientSession, concurrency: int = 20):
+    """Public REST access for the scanners, metered by a shared governor.
+
+    The semaphore bounds CONCURRENCY; the governor bounds WEIGHT. They are not
+    interchangeable: 20 concurrent klines requests are 40 weight, and the limit
+    is on weight per minute per IP, not on how many are in flight. Only the
+    governor can prevent a 418 ban, which would also take down the market-data
+    WebSocket.
+    """
+
+    def __init__(
+        self,
+        base_url: str,
+        session: aiohttp.ClientSession,
+        concurrency: int = 20,
+        governor: Optional[WeightGovernor] = None,
+    ):
         self.base_url = base_url.rstrip("/")
         self.session = session
         self.semaphore = asyncio.Semaphore(concurrency)
+        # A governor is created if none is supplied so that no construction path
+        # can end up unmetered; passing one in lets a process share a single
+        # budget across every client it builds, which is what the per-IP limit
+        # actually requires.
+        self.governor = governor or WeightGovernor()
 
     async def fetch_exchange_info(self) -> List[SymbolSnapshot]:
         url = f"{self.base_url}/api/v3/exchangeInfo"
-        async with self.session.get(url, timeout=10) as response:
-            response.raise_for_status()
-            data = await response.json()
+        data = await governed_request(
+            self.session, self.governor, "GET", url, timeout=10
+        )
         snapshots = [SymbolSnapshot.from_exchange(item) for item in data.get("symbols", [])]
         return snapshots
 
     async def fetch_hourly_klines(self, symbol: str, limit: int = 2) -> List[List[str]]:
         params = {"symbol": symbol, "interval": "1h", "limit": limit}
         async with self.semaphore:
-            async with self.session.get(f"{self.base_url}/api/v3/klines", params=params, timeout=10) as response:
-                if response.status != 200:
-                    text = await response.text()
-                    logger.warning(f"Failed to fetch klines for {symbol} [{response.status}]: {text}")
-                    return []
-                return await response.json()
+            try:
+                return await governed_request(
+                    self.session, self.governor, "GET",
+                    f"{self.base_url}/api/v3/klines", params=params, timeout=10,
+                )
+            except IpBannedError:
+                # Fatal: propagate so the scan stops instead of extending the ban.
+                raise
+            except (RateLimitedError, Exception) as exc:
+                logger.warning(f"Failed to fetch klines for {symbol}: {exc}")
+                return []
 
     async def fetch_ticker_price(self, symbol: str) -> Optional[float]:
         params = {"symbol": symbol}
-        async with self.session.get(f"{self.base_url}/api/v3/ticker/price", params=params, timeout=10) as response:
-            if response.status != 200:
-                text = await response.text()
-                logger.warning(f"Failed to fetch the latest price for {symbol} [{response.status}]: {text}")
-                return None
-            data = await response.json()
-            return float(data.get("price"))
+        try:
+            data = await governed_request(
+                self.session, self.governor, "GET",
+                f"{self.base_url}/api/v3/ticker/price", params=params, timeout=10,
+            )
+        except IpBannedError:
+            raise
+        except Exception as exc:
+            logger.warning(f"Failed to fetch the latest price for {symbol}: {exc}")
+            return None
+        return float(data.get("price"))
 
 
 class VolumeSpikeScanner:
@@ -163,7 +195,13 @@ class VolumeSpikeScanner:
             return []
 
         async with aiohttp.ClientSession() as session:
-            client = BinancePublicClient(self.config.cex.base_url, session, self.spike_cfg.concurrency)
+            client = BinancePublicClient(
+                self.config.cex.base_url, session, self.spike_cfg.concurrency,
+                governor=get_shared_governor(
+                    self.config.cex.max_request_weight_per_minute,
+                    self.config.cex.request_weight_safety_fraction,
+                ),
+            )
             snapshots = await client.fetch_exchange_info()
             usdt_symbols = [s for s in snapshots if s.quote == self.spike_cfg.quote_asset and s.status == "TRADING"]
             tasks = [self._fetch_and_compute(client, snap) for snap in usdt_symbols]
@@ -297,7 +335,13 @@ class SpikeArbitrageEvaluator:
             return []
 
         async with aiohttp.ClientSession() as session:
-            client = BinancePublicClient(self.config.cex.base_url, session)
+            client = BinancePublicClient(
+                self.config.cex.base_url, session,
+                governor=get_shared_governor(
+                    self.config.cex.max_request_weight_per_minute,
+                    self.config.cex.request_weight_safety_fraction,
+                ),
+            )
             dex_client = UniV3DexClient(self.config.dex, self.config.network, self.config.secrets, self.config.tokens)
             tasks = [self._evaluate_symbol(client, dex_client, spike) for spike in spikes]
             results = await asyncio.gather(*tasks, return_exceptions=True)

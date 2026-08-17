@@ -108,8 +108,39 @@ class CexConfig(BaseModel):
     book_depth_levels: int = 20
     book_update_ms: int = 100
 
+    # REST request-weight budget per minute. Binance's documented spot limit is
+    # 6000 weight per minute per IP; exceeding it returns 429, and continuing
+    # returns 418, which is an IP ban of two minutes to three days. A ban also
+    # blocks the market-data WebSocket, so it is an outage rather than a delay.
+    max_request_weight_per_minute: int = 6000
+
+    # Fraction of that budget this process will use. Half by default, for two
+    # reasons: the local weight table is an estimate that the exchange can
+    # disagree with, and another process on the same IP (a manual query, a
+    # second bot, a scanner run) shares the same limit. Riding the documented
+    # ceiling means the first surprise is a ban.
+    request_weight_safety_fraction: float = 0.5
+
     @model_validator(mode='after')
     def validate_cex(self) -> 'CexConfig':
+        if self.max_request_weight_per_minute <= 0:
+            raise ValueError("max_request_weight_per_minute must be positive")
+        if not 0 < self.request_weight_safety_fraction <= 1:
+            raise ValueError(
+                f"request_weight_safety_fraction must be in (0, 1], got "
+                f"{self.request_weight_safety_fraction}"
+            )
+        # The most expensive single call in use is /api/v3/depth at weight 50.
+        # A ceiling below that would make the request impossible to issue at
+        # all, and the governor would raise rather than hang -- better caught
+        # here, at startup.
+        ceiling = self.max_request_weight_per_minute * self.request_weight_safety_fraction
+        if ceiling < 50:
+            raise ValueError(
+                f"the effective request-weight ceiling is {ceiling:.0f}, which is "
+                f"below the weight of a single depth call (50). Raise "
+                f"max_request_weight_per_minute or request_weight_safety_fraction."
+            )
         if self.book_depth_levels not in (5, 10, 20):
             raise ValueError(
                 f"book_depth_levels must be 5, 10 or 20 (Binance partial book "

@@ -11,6 +11,7 @@ import aiohttp
 import websockets
 from loguru import logger
 
+from .rate_limit import WeightGovernor, governed_request
 from ..core import clock
 from ..core.config import CexConfig, SecretsConfig
 from ..core.types import BookSnapshot, MarketPair, Quote
@@ -30,7 +31,18 @@ class BinanceCexClient(CexClient):
         secrets: SecretsConfig,
         pairs: List[MarketPair],
         dashboard_publisher: Optional["DashboardPublisher"] = None,
+        governor: Optional[WeightGovernor] = None,
     ):
+        # The exchange meters REST by weight per minute per IP, and a 418 ban
+        # blocks the market-data WebSocket too -- so the client that places
+        # orders is the one that most needs a budget. A governor passed in from
+        # the application is shared with the scanners, which is what the per-IP
+        # limit actually requires; one is created here only so no construction
+        # path can end up unmetered.
+        self.governor = governor or WeightGovernor(
+            max_weight_per_minute=config.max_request_weight_per_minute,
+            safety_fraction=config.request_weight_safety_fraction,
+        )
         self.config = config
         self.secrets = secrets
         self.pairs = pairs
@@ -421,14 +433,15 @@ class BinanceCexClient(CexClient):
             
             params = {'symbol': symbol}
             try:
-                async with self._session.get(f"{self.base_url}/api/v3/ticker/bookTicker", params=params) as response:
-                    response.raise_for_status()
-                    data = await response.json(loads=orjson.loads)
-                    best_bid = Decimal(data['bidPrice'])
-                    best_ask = Decimal(data['askPrice'])
-                    bid_size = Decimal(data['bidQty'])
-                    ask_size = Decimal(data['askQty'])
-                    logger.info(f"Fetched {symbol} quote via the API: Bid={best_bid}, Ask={best_ask}")
+                data = await governed_request(
+                    self._session, self.governor, "GET",
+                    f"{self.base_url}/api/v3/ticker/bookTicker", params=params,
+                )
+                best_bid = Decimal(data['bidPrice'])
+                best_ask = Decimal(data['askPrice'])
+                bid_size = Decimal(data['bidQty'])
+                ask_size = Decimal(data['askQty'])
+                logger.info(f"Fetched {symbol} quote via the API: Bid={best_bid}, Ask={best_ask}")
             except aiohttp.ClientError as e:
                 logger.error(f"Failed to fetch the {symbol} quote via the API: {e}")
                 return None
