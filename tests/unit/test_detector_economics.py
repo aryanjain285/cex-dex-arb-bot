@@ -17,7 +17,7 @@ from typing import List, Optional, Tuple
 import pytest
 
 from src.core import clock
-from src.core.config import StrategyConfig
+from src.core.config import RotationConfig, StrategyConfig
 from src.core.types import BookSnapshot, DexQuote, MarketPair
 from src.strategy.detector import OpportunityDetector
 
@@ -36,7 +36,13 @@ def make_pair(symbol="ETH/USDT", **kw) -> MarketPair:
 
 
 def strategy(**kw) -> StrategyConfig:
-    defaults = dict(target_notional_usd=1000, taker_fee_bps=D("7.5"), min_net_bps=D(5))
+    # Rotation is disabled here so each test isolates the variable it is
+    # about. Rotation cost itself is covered by test_rotation_cost.py and
+    # test_rotation_wiring.py.
+    defaults = dict(
+        target_notional_usd=1000, taker_fee_bps=D("7.5"), min_net_bps=D(5),
+        rotation=RotationConfig(enabled=False),
+    )
     defaults.update(kw)
     return StrategyConfig(**defaults)
 

@@ -52,7 +52,8 @@ async def test_persisted_rows_survive_type_enforcement_and_are_exact(store):
     row = taken[0]
     assert Decimal(row["gas_quote"]) == D("0.017180312464164")
     recomputed = (Decimal(row["gross_quote"]) - Decimal(row["cex_fee_quote"])
-                  - Decimal(row["gas_quote"]))
+                  - Decimal(row["gas_quote"])
+                  - Decimal(row["rotation_cost_quote"]))
     assert recomputed == Decimal(row["net_quote"])
 
 

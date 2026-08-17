@@ -15,14 +15,22 @@ from decimal import Decimal
 
 import pytest
 
-from src.core.config import StrategyConfig
+from src.core.config import RotationConfig, StrategyConfig
 from src.core.types import BookSnapshot, MarketPair
 from src.strategy.detector import OpportunityDetector, RejectionReason
 from tests.fakes import D, FakeCex, FakeDex, flat_book, make_pair
 
 
 def strategy(**kw) -> StrategyConfig:
-    defaults = dict(target_notional_usd=1000, taker_fee_bps=D("7.5"), min_net_bps=D(5))
+    """Rotation ON by default here: these tests assert that a record carries
+    every cost component needed to re-derive the decision, and rotation is one
+    of them."""
+    defaults = dict(
+        target_notional_usd=1000, taker_fee_bps=D("7.5"), min_net_bps=D(5),
+        rotation=RotationConfig(
+            enabled=True, withdrawal_fee_quote=4.0, bridge_gas_quote=1.0,
+            float_quote=5000.0, transfer_risk_bps=10.0),
+    )
     defaults.update(kw)
     return StrategyConfig(**defaults)
 
@@ -112,11 +120,13 @@ async def test_records_carry_the_inputs_needed_to_re_derive_the_decision():
     # every component of the arithmetic, so a third party can reproduce it
     for field in ("size_base", "notional_quote", "cex_price", "cex_best_bid",
                   "cex_best_ask", "dex_price", "gross_quote", "cex_fee_quote",
-                  "gas_quote", "net_quote", "net_bps", "cex_legs",
-                  "taker_fee_bps", "min_net_bps"):
+                  "gas_quote", "rotation_cost_quote", "net_quote", "net_bps",
+                  "cex_legs", "taker_fee_bps", "min_net_bps"):
         assert getattr(taken, field) is not None, f"{field} must be recorded"
 
-    recomputed = taken.gross_quote - taken.cex_fee_quote - taken.gas_quote
+    # All four cost terms, so the row can be re-derived by a third party.
+    recomputed = (taken.gross_quote - taken.cex_fee_quote - taken.gas_quote
+                  - taken.rotation_cost_quote)
     assert recomputed == taken.net_quote, "the row must be self-consistent"
 
 

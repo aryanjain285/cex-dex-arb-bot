@@ -271,6 +271,50 @@ class ScannerConfig(BaseModel):
     auto_discovery: Optional[AutoDiscoveryConfig] = None
 
 
+class RotationConfig(BaseModel):
+    """Cost of moving inventory back between venues.
+
+    A CEX<->DEX arb is an inventory rotation, not a round trip: it buys base on
+    one venue and sells base on the other, so the two sides drain in opposite
+    directions and must periodically be rebalanced by physically transferring
+    assets. That transfer is neither free nor instant.
+
+    Leaving this disabled asserts that inventory rotation costs nothing. That is
+    defensible only in paper mode while measuring, and it must be an explicit
+    choice rather than a default nobody noticed.
+    """
+
+    enabled: bool = True
+
+    # Exchange withdrawal fee for one rotation, in the quote currency.
+    # Verify the live figure: Binance ERC-20 ETH is typically ~0.0012 ETH.
+    withdrawal_fee_quote: float = 4.0
+
+    # On-chain cost of the transfer or bridge, in the quote currency.
+    bridge_gas_quote: float = 1.0
+
+    # Working capital held per venue, in the quote currency. Determines how many
+    # trades one rotation funds, and therefore how far the fixed fees amortise.
+    float_quote: float = 5000.0
+
+    # Expected adverse price move on the in-transit float, in basis points.
+    # Inventory is unhedged while it moves; over a 10-minute transfer of a
+    # volatile alt this term dominates the fee.
+    transfer_risk_bps: float = 10.0
+
+    @model_validator(mode='after')
+    def validate_rotation(self) -> 'RotationConfig':
+        if self.withdrawal_fee_quote < 0:
+            raise ValueError("withdrawal_fee_quote must be non-negative")
+        if self.bridge_gas_quote < 0:
+            raise ValueError("bridge_gas_quote must be non-negative")
+        if self.transfer_risk_bps < 0:
+            raise ValueError("transfer_risk_bps must be non-negative")
+        if self.float_quote <= 0:
+            raise ValueError("float_quote must be positive")
+        return self
+
+
 class StrategyConfig(BaseModel):
     """Global strategy parameters.
 
@@ -309,6 +353,9 @@ class StrategyConfig(BaseModel):
     # otherwise be indistinguishable from a quiet market.
     max_book_age_seconds: float = 0.5
 
+    # Inventory rotation cost, amortised into every trade's economics.
+    rotation: RotationConfig = Field(default_factory=RotationConfig)
+
     @model_validator(mode='after')
     def validate_strategy(self) -> 'StrategyConfig':
         if self.target_notional_usd <= 0:
@@ -323,6 +370,15 @@ class StrategyConfig(BaseModel):
                      "intermediate_price_cache_seconds", "max_book_age_seconds"):
             if getattr(self, name) <= 0:
                 raise ValueError(f"{name} must be positive")
+        # Cross-check: a float smaller than one trade's notional cannot
+        # support the strategy at all, and would silently mis-price every
+        # evaluation instead of failing.
+        if self.rotation.enabled and self.rotation.float_quote < self.target_notional_usd:
+            raise ValueError(
+                f"rotation.float_quote ({self.rotation.float_quote}) is smaller "
+                f"than target_notional_usd ({self.target_notional_usd}): the "
+                f"strategy cannot fund a single trade at this size"
+            )
         return self
 
 class PairConfig(BaseModel):

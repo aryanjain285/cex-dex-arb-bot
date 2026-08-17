@@ -36,7 +36,13 @@ from src.exchange.cex_base import CexClient
 from src.exchange.dex_base import DexClient
 from src.infra.evaluation_store import EvaluationRecord
 from src.infra.metrics import opportunities_found
-from src.strategy.costs import BookFill, TradeEconomics, evaluate_trade, walk_book
+from src.strategy.costs import (
+    BookFill,
+    TradeEconomics,
+    amortised_rotation_cost,
+    evaluate_trade,
+    walk_book,
+)
 
 ZERO = Decimal("0")
 TEN_THOUSAND = Decimal("10000")
@@ -96,9 +102,38 @@ class OpportunityDetector:
         self.pairs = pairs
         self.store = store
         self._intermediate_price_cache: Dict[str, Tuple[Tuple[Decimal, Decimal], float]] = {}
+        self._rotation_cost_quote = self._compute_rotation_cost()
         logger.info(
             f"Opportunity detector initialised, monitoring {len(pairs)} pairs "
             f"({'recording' if store else 'NOT recording'} evaluations)."
+        )
+        if self._rotation_cost_quote > ZERO:
+            logger.info(
+                f"Inventory rotation priced at {self._rotation_cost_quote:.4f} "
+                f"per trade."
+            )
+        else:
+            logger.warning(
+                "Inventory rotation is priced at ZERO. This asserts that moving "
+                "inventory between venues is free, which it is not."
+            )
+
+    def _compute_rotation_cost(self) -> Decimal:
+        """Per-trade rotation cost, fixed for the life of the detector.
+
+        Computed once rather than per evaluation: the inputs are configuration,
+        not market data, so recomputing could only introduce divergence between
+        the number used and the number recorded.
+        """
+        rotation = self.strategy_config.rotation
+        if not rotation.enabled:
+            return ZERO
+        return amortised_rotation_cost(
+            withdrawal_fee_quote=Decimal(str(rotation.withdrawal_fee_quote)),
+            bridge_gas_quote=Decimal(str(rotation.bridge_gas_quote)),
+            float_quote=Decimal(str(rotation.float_quote)),
+            notional_quote=Decimal(str(self.strategy_config.target_notional_usd)),
+            transfer_risk_bps=Decimal(str(rotation.transfer_risk_bps)),
         )
 
     # ------------------------------------------------------------------
@@ -395,6 +430,7 @@ class OpportunityDetector:
                 dex_price=dex_price,
                 taker_fee_bps=self.strategy_config.taker_fee_bps,
                 gas_quote=gas_quote, cex_legs=cex_legs,
+                rotation_cost_quote=self._rotation_cost_quote,
             )
         except ValueError as exc:
             logger.debug(f"{pair.cex_symbol} {direction}: rejected inputs: {exc}")
@@ -478,6 +514,7 @@ class OpportunityDetector:
                 gross_quote=econ.gross_quote if econ else None,
                 cex_fee_quote=econ.cex_fee_quote if econ else None,
                 gas_quote=econ.gas_quote if econ else None,
+                rotation_cost_quote=econ.rotation_cost_quote if econ else None,
                 net_quote=econ.net_quote if econ else None,
                 net_bps=econ.net_bps if econ else None,
                 cex_legs=econ.cex_legs if econ else None,

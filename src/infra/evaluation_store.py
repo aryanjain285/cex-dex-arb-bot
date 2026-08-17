@@ -35,7 +35,7 @@ from loguru import logger
 __all__ = ["SCHEMA_VERSION", "EvaluationRecord", "EvaluationStore"]
 
 # Bump when the column set changes so old rows stay interpretable.
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 # Columns holding exact decimal quantities. Stored as TEXT, never REAL.
 _DECIMAL_COLUMNS = (
@@ -48,6 +48,7 @@ _DECIMAL_COLUMNS = (
     "gross_quote",
     "cex_fee_quote",
     "gas_quote",
+    "rotation_cost_quote",
     "net_quote",
     "net_bps",
     "min_net_bps",
@@ -84,6 +85,7 @@ class EvaluationRecord:
     gross_quote: Optional[Decimal] = None
     cex_fee_quote: Optional[Decimal] = None
     gas_quote: Optional[Decimal] = None
+    rotation_cost_quote: Optional[Decimal] = None
     net_quote: Optional[Decimal] = None
     net_bps: Optional[Decimal] = None
     cex_legs: Optional[int] = None
@@ -94,6 +96,16 @@ class EvaluationRecord:
 
 
 _RECORD_COLUMNS = [f.name for f in fields(EvaluationRecord)]
+
+# SQL types for the non-decimal columns, used when migrating an older table.
+_COLUMN_TYPES = {
+    "ts": "REAL",
+    "dex_pool_fee": "INTEGER",
+    "is_synthetic": "INTEGER",
+    "cex_legs": "INTEGER",
+    "book_age_s": "REAL",
+    "depth_levels_used": "INTEGER",
+}
 
 _CREATE_TABLE = f"""
 CREATE TABLE IF NOT EXISTS evaluations (
@@ -119,6 +131,7 @@ CREATE TABLE IF NOT EXISTS evaluations (
     gross_quote       TEXT,
     cex_fee_quote     TEXT,
     gas_quote         TEXT,
+    rotation_cost_quote TEXT,
     net_quote         TEXT,
     net_bps           TEXT,
     cex_legs          INTEGER,
@@ -152,7 +165,56 @@ class EvaluationStore:
         # survive more than process death.
         self._conn.execute("PRAGMA synchronous=FULL")
         self._conn.executescript(_CREATE_TABLE)
+        self._migrate()
         logger.info(f"Evaluation store open at {self.path} (run_id={run_id}).")
+
+
+    # ------------------------------------------------------------------
+
+    def _migrate(self) -> None:
+        """Bring an existing table up to the current column set.
+
+        `CREATE TABLE IF NOT EXISTS` does nothing to a table that already
+        exists, so adding a field to `EvaluationRecord` previously produced
+        `OperationalError: table evaluations has no column named ...` on the
+        next insert -- a crash rather than a migration. That happened for real
+        when `rotation_cost_quote` was added.
+
+        Only additive migrations are handled, which is the only kind this
+        schema needs: existing rows are backfilled as NULL rather than having a
+        value invented for them, because a fabricated value in an audit trail
+        is worse than a missing one.
+        """
+        existing = {row[1] for row in self._conn.execute("PRAGMA table_info(evaluations)")}
+        for column in _RECORD_COLUMNS:
+            if column in existing:
+                continue
+            sql_type = "TEXT" if column in _DECIMAL_COLUMNS else _COLUMN_TYPES.get(column, "TEXT")
+            self._conn.execute(f"ALTER TABLE evaluations ADD COLUMN {column} {sql_type}")
+            logger.warning(
+                f"Migrated evaluation store: added column {column} ({sql_type}). "
+                f"Pre-existing rows carry NULL for it."
+            )
+        self._conn.execute(
+            "CREATE TABLE IF NOT EXISTS schema_meta ("
+            "  key TEXT PRIMARY KEY, value TEXT NOT NULL)"
+        )
+        self._conn.execute(
+            "INSERT INTO schema_meta (key, value) VALUES ('schema_version', ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (str(SCHEMA_VERSION),),
+        )
+
+    def schema_version(self) -> int:
+        """The stored schema version.
+
+        Written per row AND recorded once here, so it can actually be checked
+        by a reader -- a version stamp nobody reads protects nothing.
+        """
+        row = self._conn.execute(
+            "SELECT value FROM schema_meta WHERE key = 'schema_version'"
+        ).fetchone()
+        return int(row[0]) if row else 0
 
     # ------------------------------------------------------------------
 

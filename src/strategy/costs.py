@@ -10,7 +10,10 @@ from dataclasses import dataclass
 from decimal import Decimal
 from typing import List, Optional, Sequence, Tuple
 
-__all__ = ["BookFill", "walk_book", "TradeEconomics", "evaluate_trade"]
+__all__ = [
+    "BookFill", "walk_book", "TradeEconomics", "evaluate_trade",
+    "amortised_rotation_cost",
+]
 
 ZERO = Decimal("0")
 TEN_THOUSAND = Decimal("10000")
@@ -95,11 +98,64 @@ def walk_book(
     )
 
 
+def amortised_rotation_cost(
+    *,
+    withdrawal_fee_quote: Decimal,
+    bridge_gas_quote: Decimal,
+    float_quote: Decimal,
+    notional_quote: Decimal,
+    transfer_risk_bps: Decimal,
+) -> Decimal:
+    """Per-trade share of the cost of moving inventory between venues.
+
+    A CEX<->DEX arb is an inventory rotation, not a round trip. `CEX_to_DEX`
+    buys base on the exchange and sells base from the on-chain wallet: two
+    different assets in two custody locations. Trading again requires physically
+    moving inventory back, which is not free and is not instantaneous.
+
+    Three costs make up a rotation:
+
+    - `withdrawal_fee_quote`: what the exchange charges to withdraw.
+    - `bridge_gas_quote`: on-chain cost of the transfer or bridge.
+    - `transfer_risk_bps`: expected adverse price move on the in-transit float,
+      which is unhedged for the duration. Charged on `float_quote`, because the
+      whole float is exposed, not just one trade's notional.
+
+    The total is amortised over `float_quote / notional_quote` trades -- how
+    many trades the float supports before a rotation becomes necessary. A
+    larger float amortises the fixed fees further; it does not reduce the
+    transfer risk per trade, because a larger float has more at risk.
+
+    Worked: a $4 withdrawal funding a $5,000 float at $1,000 notional supports
+    5 trades, so the fee contributes $0.80/trade. Against an expected $0.50 at
+    a 5 bps floor, that alone is negative-EV -- which is the point.
+    """
+    if withdrawal_fee_quote < ZERO:
+        raise ValueError("withdrawal_fee_quote must be non-negative")
+    if bridge_gas_quote < ZERO:
+        raise ValueError("bridge_gas_quote must be non-negative")
+    if transfer_risk_bps < ZERO:
+        raise ValueError("transfer_risk_bps must be non-negative")
+    if notional_quote <= ZERO:
+        raise ValueError("notional_quote must be positive")
+    if float_quote < notional_quote:
+        raise ValueError(
+            f"float_quote ({float_quote}) is smaller than one trade's notional "
+            f"({notional_quote}): the strategy cannot run at this size"
+        )
+
+    trades_per_rotation = float_quote / notional_quote
+    transfer_risk_quote = float_quote * transfer_risk_bps / TEN_THOUSAND
+    total = withdrawal_fee_quote + bridge_gas_quote + transfer_risk_quote
+    return total / trades_per_rotation
+
+
 @dataclass(frozen=True)
 class TradeEconomics:
     """What a trade is actually worth, with every cost counted exactly once.
 
-    `net_quote` is always `gross_quote - cex_fee_quote - gas_quote`. That
+    `net_quote` is always `gross_quote - cex_fee_quote - gas_quote -
+    rotation_cost_quote`. That
     identity is deliberate and is enforced by test: the DEX quote already
     carries the pool fee and the price impact for the requested size, so
     there is no further impact or slippage term to subtract. `slippage_bps`
@@ -121,6 +177,10 @@ class TradeEconomics:
     gross_quote: Decimal
     cex_fee_quote: Decimal
     gas_quote: Decimal
+    # Per-trade share of moving inventory back between venues. Unmodelled
+    # originally, and large enough at realistic float sizes to invert the sign
+    # of a marginal trade.
+    rotation_cost_quote: Decimal
     net_quote: Decimal
     net_bps: Decimal
     cex_legs: int
@@ -139,6 +199,7 @@ def evaluate_trade(
     taker_fee_bps: Decimal,
     gas_quote: Decimal,
     cex_legs: int = 1,
+    rotation_cost_quote: Decimal = ZERO,
 ) -> TradeEconomics:
     """Net economics of a two-venue trade.
 
@@ -155,6 +216,10 @@ def evaluate_trade(
             direct pair; 2 for a synthetic pair, where the intermediate
             asset must also be traded on the CEX. Gas is charged once
             regardless, because only one on-chain swap occurs.
+        rotation_cost_quote: per-trade share of moving inventory back between
+            venues, from `amortised_rotation_cost`. Defaults to zero so the
+            function stays usable in isolation, but a live configuration that
+            leaves it at zero is asserting that inventory rotation is free.
     """
     if direction not in DIRECTIONS:
         raise ValueError(f"direction must be one of {DIRECTIONS}, got {direction!r}")
@@ -168,6 +233,10 @@ def evaluate_trade(
         raise ValueError(f"taker_fee_bps must be non-negative, got {taker_fee_bps}")
     if gas_quote < ZERO:
         raise ValueError(f"gas_quote must be non-negative, got {gas_quote}")
+    if rotation_cost_quote < ZERO:
+        raise ValueError(
+            f"rotation_cost_quote must be non-negative, got {rotation_cost_quote}"
+        )
     if cex_legs < 1:
         raise ValueError(f"cex_legs must be at least 1, got {cex_legs}")
 
@@ -185,7 +254,7 @@ def evaluate_trade(
     # so one leg's fee scaled by the leg count is accurate to rounding.
     cex_fee_quote = (cex_price * size_base * taker_fee_bps / TEN_THOUSAND) * cex_legs
 
-    net_quote = gross_quote - cex_fee_quote - gas_quote
+    net_quote = gross_quote - cex_fee_quote - gas_quote - rotation_cost_quote
     net_bps = net_quote / notional_quote * TEN_THOUSAND
 
     return TradeEconomics(
@@ -199,6 +268,7 @@ def evaluate_trade(
         gross_quote=gross_quote,
         cex_fee_quote=cex_fee_quote,
         gas_quote=gas_quote,
+        rotation_cost_quote=rotation_cost_quote,
         net_quote=net_quote,
         net_bps=net_bps,
         cex_legs=cex_legs,

@@ -99,6 +99,24 @@ strategy:
   # could not fire before the damage was done.
   max_book_age_seconds: 0.5
 
+  # Inventory rotation. A CEX<->DEX arb buys base on one venue and sells base
+  # on the other, so the two sides drain in opposite directions and must be
+  # rebalanced by physically transferring assets. That is not free.
+  #
+  # Amortised as (withdrawal_fee + bridge_gas + float*transfer_risk_bps/1e4)
+  # divided by the trades one float supports (float_quote / target_notional).
+  # At the defaults below that is (4 + 1 + 5) / 5 = 2.00 per trade -- against
+  # an expected 0.50 at a 5 bps floor on 1000 notional. Which is the finding.
+  #
+  # Setting enabled: false asserts that moving inventory is free. Only
+  # defensible in paper mode while measuring.
+  rotation:
+    enabled: true
+    withdrawal_fee_quote: 4.0     # verify against your exchange's live fee
+    bridge_gas_quote: 1.0
+    float_quote: 5000.0           # working capital per venue
+    transfer_risk_bps: 10.0       # unhedged exposure while inventory moves
+
 # CEX settings (testnet)
 # cex:
 #   name: "binance-testnet"
