@@ -20,6 +20,7 @@ from pathlib import Path
 
 from loguru import logger
 
+from src.infra import metrics
 from src.core.config import RiskConfig
 from src.core.types import ExecutionSummary, Opportunity
 
@@ -110,6 +111,12 @@ class RiskManager:
             "halt_reason": self.halt_reason,
             "positions": self.positions,
         }
+        try:
+            metrics.risk_halted.set(1 if self.halted else 0)
+            metrics.daily_pnl_quote.set(float(self.daily_pnl))
+        except Exception:  # pragma: no cover - telemetry is never fatal
+            pass
+
         try:
             STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
             tmp = STATE_FILE.with_suffix(STATE_FILE.suffix + ".tmp")

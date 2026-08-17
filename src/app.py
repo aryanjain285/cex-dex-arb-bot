@@ -16,6 +16,8 @@ from .infra.logging import setup_logging
 from .infra.metrics import setup_metrics
 from .infra.dashboard import DashboardPublisher
 from .infra.evaluation_store import EvaluationStore
+from .infra.lifecycle import ShutdownSignal, drain, install_signal_handlers
+from .infra import metrics
 from .exchange.binance import BinanceCexClient
 from .exchange.univ3 import UniV3DexClient
 from .strategy.detector import OpportunityDetector
@@ -34,6 +36,10 @@ class ArbiBotApp:
         self.metrics_server = setup_metrics(config.observability)
         self.running = False
         self.mode = mode
+        # Latched by SIGTERM/SIGINT so the loop exits between iterations
+        # rather than the interpreter dying mid-await.
+        self.shutdown_signal = ShutdownSignal()
+        self._cycle_task: Optional[asyncio.Task] = None
         self.dashboard_publisher = None
 
         # 1. Load static pairs from config
@@ -207,6 +213,11 @@ class ArbiBotApp:
     async def start(self):
         self.logger.info("Bot starting...")
         self.running = True
+
+        # SIGTERM is what systemd and docker send. Without a handler the
+        # interpreter dies without unwinding, so shutdown() never runs.
+        install_signal_handlers(asyncio.get_running_loop(), self.shutdown_signal)
+
         await self.cex_client.connect()
 
         if self.config.risk.cancel_all_on_start:
@@ -226,14 +237,26 @@ class ArbiBotApp:
             await self.shutdown()
 
     async def main_loop(self):
-        while self.running:
+        while self.running and not self.shutdown_signal.requested:
+            cycle_started = clock.monotonic()
             try:
                 opportunities = await self.detector.detect()
+                try:
+                    metrics.cycle_duration_seconds.observe(
+                        clock.monotonic() - cycle_started
+                    )
+                except Exception:  # pragma: no cover
+                    pass
                 if not opportunities:
                     await asyncio.sleep(self.config.strategy.loop_interval_seconds)
                     continue
 
                 for opp in opportunities:
+                    if self.shutdown_signal.requested:
+                        self.logger.info(
+                            "Shutdown requested mid-cycle; not starting further trades."
+                        )
+                        break
                     self.logger.info(f"Opportunity found: {opp.direction} | edge: {opp.edge_bps:.2f} bps | expected PnL: {opp.expected_pnl_quote:.4f}")
 
                     plan = self.router.plan(opp)
@@ -248,13 +271,42 @@ class ArbiBotApp:
 
                     self.risk_manager.update_state(exec_summary)
 
+            except asyncio.CancelledError:
+                raise
             except Exception as e:
-                self.logger.error(f"Unexpected error in the main loop: {e}", exc_info=True)
-                await asyncio.sleep(5)
+                # A permanent fault would otherwise loop here forever without
+                # exiting and without alerting. Count consecutive failures and
+                # give up, so the supervisor can escalate.
+                self._consecutive_errors = getattr(self, "_consecutive_errors", 0) + 1
+                self.logger.error(
+                    f"Unexpected error in the main loop "
+                    f"(consecutive: {self._consecutive_errors}): {e}",
+                    exc_info=True,
+                )
+                if self._consecutive_errors >= self.config.strategy.max_consecutive_errors:
+                    self.logger.error(
+                        f"Aborting: {self._consecutive_errors} consecutive loop "
+                        f"failures reached the limit of "
+                        f"{self.config.strategy.max_consecutive_errors}. Exiting so "
+                        f"the supervisor can escalate rather than looping silently."
+                    )
+                    self.shutdown_signal.request("consecutive loop failures")
+                    raise
+                await asyncio.sleep(self.config.strategy.error_backoff_seconds)
+            else:
+                self._consecutive_errors = 0
 
     async def shutdown(self):
-        self.logger.info("Bot shutting down...")
+        reason = self.shutdown_signal.reason or "requested"
+        self.logger.info(f"Bot shutting down ({reason})...")
         self.running = False
+
+        # Give in-flight work a bounded chance to finish before the clients are
+        # torn out from under it. An unbounded wait is a hang; no wait at all
+        # abandons anything mid-flight.
+        if self._cycle_task is not None:
+            await drain([self._cycle_task],
+                        timeout=self.config.strategy.shutdown_drain_seconds)
         await self.cex_client.close()
         # The Prometheus server runs as a daemon thread; no explicit stop is required.
         if self.dashboard_publisher:

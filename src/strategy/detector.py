@@ -35,6 +35,7 @@ from src.core.types import BookSnapshot, MarketPair, Opportunity
 from src.exchange.cex_base import CexClient
 from src.exchange.dex_base import DexClient
 from src.infra.evaluation_store import EvaluationRecord
+from src.infra import metrics
 from src.infra.metrics import opportunities_found
 from src.strategy.costs import (
     BookFill,
@@ -205,6 +206,10 @@ class OpportunityDetector:
         # precisely this strategy's universe. A dead connection, by contrast,
         # invalidates every book at once.
         feed_age = book.feed_age_seconds(clock.now())
+        try:
+            metrics.feed_age_seconds.set(feed_age)
+        except Exception:  # pragma: no cover
+            pass
         if feed_age > self.strategy_config.max_book_age_seconds:
             logger.warning(
                 f"Market data feed is stale ({feed_age:.2f}s since the last frame, "
@@ -490,9 +495,28 @@ class OpportunityDetector:
         occasionally loses a row, so every failure here is logged and
         swallowed.
         """
+        econ = ev.econ
+
+        # Counted regardless of whether a store is configured. This is the
+        # series that distinguishes a quiet market from a wedged loop: the
+        # most common decision -- rejected below the floor -- previously
+        # produced no metric and no log at the configured level, so a cycle
+        # that evaluated everything and rejected everything was
+        # indistinguishable from a cycle that did nothing.
+        try:
+            metrics.evaluations_total.labels(
+                pair=pair.cex_symbol,
+                direction=ev.direction or "none",
+                outcome="taken" if taken else "rejected",
+                reason="none" if taken else (ev.reason or "unknown"),
+            ).inc()
+            if ev.book_age_s is not None:
+                metrics.book_age_seconds.labels(pair=pair.cex_symbol).set(ev.book_age_s)
+        except Exception as exc:  # pragma: no cover - telemetry is never fatal
+            logger.debug(f"Failed to emit evaluation metrics: {exc}")
+
         if self.store is None:
             return
-        econ = ev.econ
         try:
             self.store.record(EvaluationRecord(
                 ts=clock.now(),

@@ -353,6 +353,17 @@ class StrategyConfig(BaseModel):
     # otherwise be indistinguishable from a quiet market.
     max_book_age_seconds: float = 0.5
 
+    # Consecutive main-loop failures tolerated before the process exits.
+    # A permanent fault previously looped forever, logging and sleeping,
+    # without exiting and without alerting.
+    max_consecutive_errors: int = 10
+
+    # Sleep after a main-loop error, in seconds.
+    error_backoff_seconds: float = 5.0
+
+    # How long shutdown waits for in-flight work before cancelling it.
+    shutdown_drain_seconds: float = 10.0
+
     # Inventory rotation cost, amortised into every trade's economics.
     rotation: RotationConfig = Field(default_factory=RotationConfig)
 
@@ -366,8 +377,11 @@ class StrategyConfig(BaseModel):
             raise ValueError("min_net_bps must be non-negative")
         if self.max_net_bps_sanity <= self.min_net_bps:
             raise ValueError("max_net_bps_sanity must exceed min_net_bps")
+        if self.max_consecutive_errors < 1:
+            raise ValueError("max_consecutive_errors must be at least 1")
         for name in ("opportunity_ttl_seconds", "loop_interval_seconds",
-                     "intermediate_price_cache_seconds", "max_book_age_seconds"):
+                     "intermediate_price_cache_seconds", "max_book_age_seconds",
+                     "error_backoff_seconds", "shutdown_drain_seconds"):
             if getattr(self, name) <= 0:
                 raise ValueError(f"{name} must be positive")
         # Cross-check: a float smaller than one trade's notional cannot
