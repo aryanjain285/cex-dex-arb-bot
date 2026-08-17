@@ -1,0 +1,241 @@
+import asyncio
+import json
+from typing import List
+from pathlib import Path
+
+try:
+    import uvloop
+except ImportError:  # uvloop does not support Windows
+    uvloop = None
+
+from .core.config import load_config, AppConfig
+from .core.types import MarketPair
+from .infra.logging import setup_logging
+from .infra.metrics import setup_metrics
+from .infra.dashboard import DashboardPublisher
+from .exchange.binance import BinanceCexClient
+from .exchange.univ3 import UniV3DexClient
+from .strategy.detector import OpportunityDetector
+from .strategy.router import SimpleRouter
+from .strategy.executor import TransactionExecutor, PaperExecutor
+from .risk.limits import RiskManager
+
+# Install uvloop for improved async performance where it is available
+if uvloop is not None:
+    uvloop.install()
+
+class ArbiBotApp:
+    def __init__(self, config: AppConfig, mode: str = 'live'):
+        self.config = config
+        self.logger = setup_logging(config.observability)
+        self.metrics_server = setup_metrics(config.observability)
+        self.running = False
+        self.mode = mode
+        self.dashboard_publisher = None
+
+        # 1. Load static pairs from config
+        static_pairs: List[MarketPair] = []
+        for p in config.pairs:
+            # Authoritative lookup for decimals for static pairs
+            base_token_details = config.tokens.get(p.base, {}).get(p.dex_chain)
+            quote_token_details = config.tokens.get(p.quote, {}).get(p.dex_chain)
+
+            pair = MarketPair(
+                base=p.base,
+                quote_cex=p.quote,
+                quote_dex=p.quote, # For direct pairs, CEX and DEX quotes are the same
+                cex_symbol=p.cex_symbol,
+                dex_chain=p.dex_chain,
+                dex_pool_fee=p.dex_pool_fee,
+                base_address=base_token_details.address if base_token_details else None,
+                quote_address=quote_token_details.address if quote_token_details else None,
+                base_decimals=base_token_details.decimals if base_token_details else None,
+                quote_decimals=quote_token_details.decimals if quote_token_details else None,
+                base_precision=p.base_precision if p.base_precision is not None else 8,
+                quote_precision=p.quote_precision if p.quote_precision is not None else 8,
+                # Copy strategy params from static config
+                min_edge_bps=p.min_edge_bps,
+                max_slippage_bps=p.max_slippage_bps,
+                max_size_quote=p.max_size_quote,
+                price_floor_quote=p.price_floor_quote,
+                price_ceiling_quote=p.price_ceiling_quote,
+                max_edge_bps=p.max_edge_bps,
+                edge_safety_multiplier=p.edge_safety_multiplier,
+            )
+            static_pairs.append(pair)
+
+        # 2. Load dynamic pairs from auto-discovery JSON
+        dynamic_pairs = self._load_discovered_pairs(config)
+
+        # 3. Combine and de-duplicate pairs
+        final_pairs = {p.cex_symbol: p for p in static_pairs}
+        for p in dynamic_pairs:
+            if p.cex_symbol not in final_pairs:
+                final_pairs[p.cex_symbol] = p
+
+        pairs = list(final_pairs.values())
+        self.logger.info(f"Total monitored pairs: {len(pairs)}. (Static: {len(static_pairs)}, Dynamic: {len(dynamic_pairs)})")
+        if not pairs:
+            self.logger.warning("No trading pairs configured; the bot will not trade.")
+
+        if config.dashboard.enabled:
+            self.dashboard_publisher = DashboardPublisher(
+                config.dashboard.redis_url,
+                config.dashboard.channel,
+            )
+        self.cex_client = BinanceCexClient(config.cex, config.secrets, pairs, dashboard_publisher=self.dashboard_publisher)
+        self.dex_client = UniV3DexClient(config.dex, config.network, config.secrets, config.tokens)
+        self.risk_manager = RiskManager(config.risk)
+        self.detector = OpportunityDetector(config.strategy, self.cex_client, self.dex_client, pairs)
+        self.router = SimpleRouter()
+
+        # Select the executor based on the run mode
+        if self.mode == 'paper':
+            self.executor = PaperExecutor(pairs)
+        else:
+            self.executor = TransactionExecutor(self.cex_client, self.dex_client, self.risk_manager, pairs)
+        self.logger.info(f"Application initialised in {self.mode.upper()} mode.")
+
+    def _load_discovered_pairs(self, config: AppConfig) -> List[MarketPair]:
+        """Load dynamically discovered pairs from auto_discovery.json."""
+        if not config.scanner or not config.scanner.auto_discovery:
+            return []
+
+        discovery_path = Path(config.scanner.auto_discovery.persist_path)
+        if not discovery_path.exists():
+            self.logger.info("auto_discovery.json not found; skipping dynamic pair loading.")
+            return []
+
+        try:
+            with discovery_path.open("r", encoding="utf-8") as f:
+                data = json.load(f)
+
+            discovered_pairs = []
+            opportunities = data.get("opportunities", [])
+            self.logger.info(f"Loaded {len(opportunities)} dynamic opportunities from {discovery_path}.")
+
+            for opp in opportunities:
+                if not opp.get("dex_candidates"):
+                    continue
+
+                candidate = opp["dex_candidates"][0]
+                raw_pool = candidate.get("raw_pool_data")
+
+                if not raw_pool:
+                    self.logger.warning(f"Skipping opportunity {opp['symbol']} because raw_pool_data is missing.")
+                    continue
+
+                # --- Correctly identify token details from raw_pool_data ---
+                token0 = raw_pool['token0']
+                token1 = raw_pool['token1']
+
+                # Normalize symbols to correctly identify base/quote
+                token0_norm_sym = token0['symbol'].upper().replace('WETH', 'ETH').split('.')[0]
+                token1_norm_sym = token1['symbol'].upper().replace('WETH', 'ETH').split('.')[0]
+
+                base_details_raw, quote_details_raw = (token0, token1) if token0_norm_sym == opp["base"] else (token1, token0)
+
+                # --- Authoritative Decimal Lookup ---
+                is_synthetic = raw_pool.get('is_synthetic', False)
+                intermediate_symbol = raw_pool.get('intermediate_symbol') if is_synthetic else None
+
+                # For synthetic pairs, decimals MUST come from the raw pool data to match the on-chain addresses.
+                if is_synthetic:
+                    base_decimals = base_details_raw.get('decimals', 18)
+                    quote_decimals = quote_details_raw.get('decimals', 18) # This is the intermediate token's decimals
+                    quote_dex = intermediate_symbol
+                else:
+                    # For direct pairs, we can use the authoritative lookup.
+                    base_token_config = config.tokens.get(opp["base"], {}).get(candidate["chain"])
+                    quote_token_config = config.tokens.get(opp["quote"], {}).get(candidate["chain"])
+                    base_decimals = base_token_config.decimals if base_token_config else base_details_raw.get('decimals', 18)
+                    quote_decimals = quote_token_config.decimals if quote_token_config else quote_details_raw.get('decimals', 18)
+                    quote_dex = opp["quote"]
+
+                # Load default strategy params from config for dynamic pairs
+                default_params = config.scanner.volume.default_pair_params
+                pair = MarketPair(
+                    base=opp["base"],
+                    quote_cex=opp["quote"],
+                    quote_dex=quote_dex,
+                    cex_symbol=opp["symbol"],
+                    dex_chain=candidate["chain"],
+                    dex_pool_fee=candidate["fee"],
+                    base_address=base_details_raw['address'],
+                    quote_address=quote_details_raw['address'],
+                    base_decimals=base_decimals,
+                    quote_decimals=quote_decimals,
+                    is_synthetic=is_synthetic,
+                    intermediate_symbol=intermediate_symbol,
+                    base_precision=8,
+                    quote_precision=8,
+                    min_edge_bps=default_params.get("min_edge_bps"),
+                    max_slippage_bps=default_params.get("max_slippage_bps"),
+                    max_size_quote=default_params.get("max_size_quote"),
+                    price_floor_quote=default_params.get("price_floor_quote"),
+                    price_ceiling_quote=default_params.get("price_ceiling_quote"),
+                    max_edge_bps=default_params.get("max_edge_bps"),
+                    edge_safety_multiplier=default_params.get("edge_safety_multiplier"),
+                )
+                discovered_pairs.append(pair)
+            return discovered_pairs
+        except Exception as e:
+            self.logger.error(f"Error reading or parsing {discovery_path}: {e}", exc_info=True)
+            return []
+
+    async def start(self):
+        self.logger.info("Bot starting...")
+        self.running = True
+        await self.cex_client.connect()
+
+        if self.config.risk.cancel_all_on_start:
+            self.logger.info("Cancelling all existing CEX orders (not yet implemented)...")
+            # await self.cex_client.cancel_all_orders()
+
+        self.logger.info("Bot started; waiting for the CEX order book to synchronise...")
+        # Give the WebSocket order book a few seconds to perform its initial sync
+        await asyncio.sleep(5)
+        self.logger.info("Beginning market monitoring...")
+
+        try:
+            await self.main_loop()
+        except asyncio.CancelledError:
+            self.logger.info("Main loop cancelled.")
+        finally:
+            await self.shutdown()
+
+    async def main_loop(self):
+        while self.running:
+            try:
+                opportunities = await self.detector.detect()
+                if not opportunities:
+                    await asyncio.sleep(0.2) # avoid a tight spin loop
+                    continue
+
+                for opp in opportunities:
+                    self.logger.info(f"Opportunity found: {opp.direction} | edge: {opp.edge_bps:.2f} bps | expected PnL: {opp.expected_pnl_quote:.4f}")
+
+                    plan = self.router.plan(opp)
+                    self.logger.debug(f"Execution plan generated: {plan}")
+
+                    if not self.risk_manager.is_trade_allowed(plan):
+                        self.logger.warning(f"Trade blocked by the risk manager: {plan.pair.cex_symbol}")
+                        continue
+
+                    exec_summary = await self.executor.run(plan)
+                    self.logger.info(f"Execution complete: {exec_summary}")
+
+                    self.risk_manager.update_state(exec_summary)
+
+            except Exception as e:
+                self.logger.error(f"Unexpected error in the main loop: {e}", exc_info=True)
+                await asyncio.sleep(5)
+
+    async def shutdown(self):
+        self.logger.info("Bot shutting down...")
+        self.running = False
+        await self.cex_client.close()
+        # The Prometheus server runs as a daemon thread; no explicit stop is required.
+        if self.dashboard_publisher:
+            await self.dashboard_publisher.close()
+        self.logger.info("Bot shut down cleanly.")

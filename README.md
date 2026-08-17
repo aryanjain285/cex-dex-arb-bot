@@ -1,0 +1,179 @@
+# DexCex: High-Frequency Arbitrage Bot
+
+This is a sophisticated high-frequency trading bot designed to execute arbitrage strategies between Centralized Exchanges (CEX), like Binance, and Decentralized Exchanges (DEX), like Uniswap v3.
+
+The bot is architected to be modular, extensible, and performant, utilizing modern Python features and robust libraries.
+
+## Core Features
+
+- **CEX & DEX Integration**: Connects to Binance for centralized order book data and trading, and to Uniswap v3-compatible DEXs across multiple chains for decentralized trading.
+- **Advanced Opportunity Detection**: Implements logic for both direct arbitrage (e.g., `TOKEN/USDT` on CEX vs. `TOKEN/USDT` on DEX) and triangular/synthetic arbitrage (e.g., `TOKEN/USDT` on CEX vs. `TOKEN/WETH` on DEX).
+- **Automated Discovery Engine**: A powerful, three-step workflow to automatically discover, validate, and trade on new arbitrage opportunities, removing the need for manual configuration.
+- **Risk Management**: A per-leg maximum notional cap. Additional controls (daily loss limit, position cap, circuit breaker) are declared in config but not yet enforced — see [Project Status](#project-status).
+- **State Persistence**: Maintains state for daily PnL and positions, ensuring resilience across restarts.
+- **High Performance**: Built on `asyncio` and `uvloop` for high-throughput, low-latency operations.
+- **Observability**: Integrated with Prometheus for metrics and provides structured, readable logging.
+
+---
+
+## Project Status
+
+Honest state of the codebase, so you know what you're building on.
+
+### Working and verified
+
+| Area | Status |
+|---|---|
+| Uniswap v3 quoting (QuoterV2, multi-chain) | Verified live against Ethereum and Base pools |
+| Binance order book (REST snapshot + WS diff) | Verified live; local book tracks the market tick-for-tick |
+| Opportunity detection + gas-aware threshold | Working |
+| Synthetic (triangular) pair pricing | Working |
+| Paper trading mode | Working |
+| Prometheus metrics / Redis dashboard | Working |
+| Test suite | 16/16 passing |
+
+### Not yet implemented
+
+- **Live execution.** `TransactionExecutor` builds the two-leg plan and computes expected PnL, but does not place orders — it never calls `create_order()` or `execute_swap()`. `run` and `paper` currently behave identically. Wiring this up is the main outstanding work.
+- **Risk controls.** Only `max_notional_per_leg_quote` is enforced. `max_position_per_asset`, `circuit_breaker_bps`, and `cancel_all_on_start` are read from config but not acted on, and there is no daily loss limit.
+- **Hedging.** There is no handling for the case where one leg fills and the other does not. `HedgingError` is defined but never raised.
+
+### Known issues to address before live trading
+
+1. **`amountOutMinimum` is `0`** in `execute_swap` (`src/exchange/univ3.py`). Any swap would accept any output — an open invitation to a sandwich. Derive it from the quote and `max_slippage_bps`.
+2. **Token approvals are unlimited** (`2**256 - 1`). Approve only what each swap needs.
+3. **Router ABI mismatch.** The swap call passes a `deadline` field, but the configured router addresses are all SwapRouter02, which removed `deadline` from that struct.
+4. **Buy-leg size units.** The detector passes a base-denominated size to `get_quote(side="buy")`, which interprets it as a quote amount. This under-measures slippage and inflates the `DEX_to_CEX` edge.
+5. **No rate limiting or caching** in the hot loop: two `eth_call`s per pair per iteration, plus an uncached CoinGecko request per quote. This will hit RPC limits as the pair count grows.
+6. **`spike.py` and `backtest/simulator.py` reference stale field names** from an earlier version of `MarketPair` / `ExecutionSummary` and raise on their first real call.
+
+---
+
+## Core Workflow: Automated Opportunity Discovery
+
+The primary method for finding and executing trades is the automated discovery workflow. This process ensures that all opportunities are based on officially verified token contracts, thereby eliminating risks from fraudulent or "scam" tokens.
+
+This is a three-step process.
+
+### Step 1: Build the Authoritative Token List (One-time Setup)
+
+This is the most critical step for ensuring data integrity. We will generate a local, authoritative list of official token contract addresses by cross-referencing Binance's spot market with CoinGecko's public data.
+
+**Command:**
+```bash
+python -m src.scanner.token_address_builder
+```
+
+**What it does:**
+1.  Fetches all active spot market symbols from Binance.
+2.  For each symbol, queries the CoinGecko API to find its official contract addresses on various chains (e.g., Ethereum, Arbitrum, Base).
+3.  Saves this verified data into `data/master_token_list.json`.
+
+> **Note:** This script communicates with the public CoinGecko API, which has a rate limit. The script includes a delay, so the initial run may take 15-20 minutes. You only need to run this periodically (e.g., weekly) to update your list with new tokens.
+
+### Step 2: Scan for Liquid DEX Pools
+
+Next, we scan the DEX subgraphs to build a local database of all available and sufficiently liquid pools.
+
+**Command:**
+```bash
+python src/scanner/dex_pool_scanner.py
+```
+
+**What it does:**
+- Queries Uniswap v3-compatible subgraphs on supported chains (Ethereum, Arbitrum, Base).
+- Fetches a comprehensive list of pools that meet a minimum liquidity threshold.
+- Saves the raw pool data to `data/target_pools_Dex.json`.
+
+### Step 3: Run the Auto-Discovery Engine
+
+This is the main engine that finds arbitrage opportunities. It cross-references CEX volume spikes with our verified local DEX data.
+
+**Command:**
+```bash
+python -m src.cli.main autodiscover
+```
+
+**What it does:**
+1.  Scans Binance for assets with recent volume spikes.
+2.  Loads the DEX pool data from `data/target_pools_Dex.json`.
+3.  Loads the official address list from `data/master_token_list.json`.
+4.  **Address Verification**: It filters the DEX pools, keeping only those whose token addresses match the official addresses in our master list. This is the key step where "scam" tokens are eliminated.
+5.  For each valid CEX volume spike, it finds corresponding DEX pools (both direct and synthetic) and evaluates potential arbitrage opportunities.
+6.  Saves any viable opportunities into `data/auto_discovery.json`.
+
+---
+
+## Getting Started
+
+### 1. Installation
+
+```bash
+# Clone the repository
+git clone <repository_url>
+cd DexCex_bot
+
+# Create and activate a virtual environment.
+# Use Python 3.11 - several pinned dependencies do not build on newer interpreters.
+python3.11 -m venv .venv
+source .venv/bin/activate        # Windows: .venv\Scripts\activate
+
+# Install dependencies
+pip install -r requirements.txt
+```
+
+> `uvloop` is a Linux/macOS-only dependency and is imported conditionally, so the
+> project runs on Windows without it (just without the event-loop speedup).
+
+### 2. Configuration
+
+- Copy the `.env.example` file to `.env`:
+  ```bash
+  cp .env.example .env
+  ```
+- Edit the `.env` file and fill in your API keys and wallet private key:
+  - `BINANCE_API_KEY`: Your Binance API key.
+  - `BINANCE_API_SECRET`: Your Binance API secret.
+  - `DEX_WALLET_PRIVATE_KEY`: The private key of the wallet you will use for DEX trades. **(CRITICAL: Handle with extreme care.)** This one is mandatory — config loading fails without it, even for read-only commands.
+  - RPC URLs for the chains you intend to use (e.g., `BASE_RPC_URL`).
+  - `COINGECKO_API_KEY` and `THEGRAPH_API_KEY`: required by the two discovery scripts in the Core Workflow above.
+
+- Review and adjust configuration files in the `config/` directory, especially:
+  - `default.yaml`: Main application settings.
+  - `pairs.yaml`: For statically configured trading pairs.
+  - `tokens.yaml`: Pre-defined addresses and decimals for common tokens.
+
+### 3. Running the Bot
+
+First, follow the **Core Workflow** described above to generate the necessary data files (`master_token_list.json`, `target_pools_Dex.json`, `auto_discovery.json`).
+
+Once the discovery process is complete, you can start the bot in paper trading mode to monitor its behavior.
+
+**Run in Paper Trading Mode:**
+```bash
+python -m src.cli.main paper
+```
+
+**What it does:**
+- Loads both static pairs from `config/pairs.yaml` and dynamically discovered pairs from `data/auto_discovery.json`.
+- Connects to all exchanges and starts monitoring for the loaded opportunities.
+- When an opportunity is found and passes all risk checks, it will log a simulated trade but **will not** execute any real orders.
+
+**Run in Live Trading Mode:**
+> **WARNING**: Live trading involves real funds. Ensure your configuration is thoroughly tested in paper mode before proceeding.
+
+```bash
+python -m src.cli.main run
+```
+
+## CLI Commands
+
+The application provides several useful CLI commands:
+
+- `paper`: Run the bot in paper trading mode.
+- `run`: Run the bot in live trading mode.
+- `autodiscover`: Run the full opportunity discovery and validation engine.
+- `rebalance`: Perform a one-time check and rebalance of assets on the CEX.
+- `check-dex-balance`: Show the balance of all configured tokens on the DEX wallet.
+
+Use the `--help` flag for more information on any command, e.g., `python -m src.cli.main --help`.

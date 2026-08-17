@@ -1,0 +1,35 @@
+# Secrets
+.env
+
+# Scratch / local-only
+other/
+.claude/settings.local.json
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.venv/
+venv/
+venv_uniswap_swapper/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Generated data.
+# Scoped to data/ so contract ABIs and other required JSON stay tracked.
+data/*.json
+data/*.yaml
+!data/target_pools_Dex.json
+!data/.gitkeep
+
+# Node
+node_modules/
+dashboard/backend/node_modules/
+dashboard/frontend/node_modules/
+dashboard/frontend/build/

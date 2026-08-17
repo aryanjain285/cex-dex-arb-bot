@@ -1,0 +1,17 @@
+scanner:
+  auto_discovery:
+    enabled: true
+    quote_asset: "USDT"
+    lookback_hours: 2
+    ratio_threshold: 1.5
+    scan_interval_minutes: 30
+    max_candidates: 10
+    concurrency: 20
+    persist_path: "data/auto_discovery.json"
+    missing_tokens_path: "data/missing_tokens.json"
+    dex_pool_dataset: "data/target_pools_Dex.json"
+    target_quote_currencies: ["USDT", "USDC"]
+    arbitrage:
+      edge_threshold_bps: 30
+      cost_buffer_bps: 15
+      probe_size_base: 1.0

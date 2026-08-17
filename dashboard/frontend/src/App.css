@@ -1,0 +1,33 @@
+body {
+  background-color: #282c34;
+  color: white;
+}
+
+.App {
+  text-align: center;
+}
+
+.log-opportunity {
+  color: #28a745; /* Green */
+}
+
+.log-info {
+  color: #17a2b8; /* Cyan */
+}
+
+.log-error {
+  color: #dc3545; /* Red */
+}
+
+.log-warning {
+  color: #ffc107; /* Yellow */
+}
+
+pre {
+  text-align: left;
+  white-space: pre-wrap; /* Since CSS 2.1 */
+  white-space: -moz-pre-wrap; /* Mozilla, since 1999 */
+  white-space: -pre-wrap; /* Opera 4-6 */
+  white-space: -o-pre-wrap; /* Opera 7 */
+  word-wrap: break-word; /* Internet Explorer 5.5+ */
+}

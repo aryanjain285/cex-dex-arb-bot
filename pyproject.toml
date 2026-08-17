@@ -1,0 +1,21 @@
+[tool.ruff]
+line-length = 88
+select = ["E", "W", "F", "I", "C", "B"]
+ignore = ["B008"]
+
+[tool.mypy]
+python_version = "3.11"
+warn_return_any = true
+warn_unused_configs = true
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+pythonpath = [
+    ".",
+    "src",
+]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+markers = [
+    "anyio",
+]

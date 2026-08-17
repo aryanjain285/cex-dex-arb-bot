@@ -1,0 +1,42 @@
+# Chain-specific token configurations
+# Add any tokens you want to trade here.
+# Ensure the symbol, address, and decimals are correct for each chain.
+
+tokens:
+  WETH:
+    ethereum:
+      address: "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"
+      decimals: 18
+    arbitrum:
+      address: "0x82aF49447D8a07e3bd95BD0d56f35241523fBab1"
+      decimals: 18
+    base:
+      address: "0x4200000000000000000000000000000000000006"
+      decimals: 18
+
+  USDT:
+    ethereum:
+      address: "0xdAC17F958D2ee523a2206206994597C13D831ec7"
+      decimals: 6
+    arbitrum:
+      address: "0xFd086bC7CD5C481DCC9C85ebE478A1C0b69FCbb9"
+      decimals: 6
+    base:
+      address: "0xfde4C96c8593536E31F229EA8f37b2ADa2699bb2"
+      decimals: 6
+
+  USDC:
+    ethereum:
+      address: "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"
+      decimals: 6
+    arbitrum:
+      address: "0xaf88d065e77c8cC2239327C5EDb3A432268e5831"
+      decimals: 6
+    base:
+      address: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
+      decimals: 6
+
+  ARB:
+    arbitrum:
+      address: "0x912CE59144191C1204E64559FE8253a0e49E6548"
+      decimals: 18

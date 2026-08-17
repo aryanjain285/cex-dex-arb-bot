@@ -1,0 +1,98 @@
+# Global environment: "dev" | "prod"
+env: "dev"
+
+# Network and gas settings
+network:
+  # RPC URLs are read from the .env file
+  default_chain: "base"
+  native_token:
+    ethereum: "ETH"
+    arbitrum: "ETH"
+    bsc: "BNB"
+    base: "ETH"
+  max_pending_seconds: 30       # max time to wait for a DEX transaction to be mined
+  gas_estimation_chain: "base"  # chain used for generic gas cost estimation
+  # EIP-1559 fee settings
+  priority_fee_gwei: 2.0        # tip paid to validators
+  max_fee_gwei: 60.0            # maximum total gas fee you are willing to pay
+
+# Shared DEX settings
+dex:
+  # Contract addresses per chain. "router" refers to SwapRouter02.
+  uniswap_v3:
+    ethereum:
+      router: "0x68b3465833fb72A70ecDF485E0e4C7bD8665Fc45"
+      quoter_v2: "0x61fFE014bA17989E743c5F6cB21bF9697530B21e"
+      weth: "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"
+      factory: "0x1F98431c8aD98523631AE4a59f267346ea31F984"
+    arbitrum:
+      router: "0x68b3465833fb72A70ecDF485E0e4C7bD8665Fc45"
+      quoter_v2: "0x61fFE014bA17989E743c5F6cB21bF9697530B21e"
+      weth: "0x82aF49447D8a07e3bd95BD0d56f35241523fBab1"
+      factory: "0x1F98431c8aD98523631AE4a59f267346ea31F984"
+    base:
+      router: "0x2626664c2603336E57B271c5C0b26F421741e481"
+      quoter_v2: "0x3d4e44Eb1374240CE5F1B871ab261CD16335B76a"
+      weth: "0x4200000000000000000000000000000000000006"
+      factory: "0x33128a8fC17869897dcE68Ed026d694621f6FDfD"
+    bsc:
+      router: "0xB971eF87ede563556b2ED4b1C0b0019111Dd85d2"
+      quoter_v2: "0x78D78E420Da98ad378D7799bE8f4AF69033EB077"
+      weth: "0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c"
+      factory: "0xdB1d10011AD0Ff90774D0C6Bb92e5C5c8b4461F7"
+
+# CEX settings (mainnet)
+cex:
+  name: "binance"
+  base_url: "https://api.binance.com"
+  ws_url: "wss://stream.binance.com:9443/ws"
+  # API credentials are read from the .env file
+  api_key_env: "BINANCE_API_KEY"
+  api_secret_env: "BINANCE_API_SECRET"
+  recv_window_ms: 5000
+
+# Strategy settings
+strategy:
+  # Target notional size in USD for each trade.
+  target_notional_usd: 10
+  # Minimum edge in basis points required to trigger a trade.
+  min_edge_bps: 5
+  # Maximum slippage in basis points allowed for a trade.
+  max_slippage_bps: 15
+
+# CEX settings (testnet)
+# cex:
+#   name: "binance-testnet"
+#   base_url: "https://testnet.binance.vision"
+#   ws_url: "wss://testnet.binance.vision/ws"
+#   api_key_env: "BINANCE_API_KEY"
+#   api_secret_env: "BINANCE_API_SECRET"
+#   recv_window_ms: 5000
+
+# Risk and position management
+risk:
+  max_notional_per_leg_quote: 10000  # per-leg notional cap, in the quote currency
+  max_position_per_asset: 2.0        # max inventory of a single asset (e.g. ETH)
+  circuit_breaker_bps: 250           # trip the breaker when realised price deviates 2.5% from expected
+  cancel_all_on_start: true          # cancel all resting orders on startup
+  cancel_all_on_shutdown: true       # cancel all resting orders on shutdown
+
+# Inventory rebalancing
+inventory:
+  rebalance:
+    enable: true
+    target_ratio: 0.5              # target value ratio of base vs quote asset on the CEX (0.5 = 1:1)
+    trigger_bps: 500               # rebalance when the ratio drifts more than 5% from target
+    method: "on_cex"               # "on_cex" | "on_dex" | "cross"
+
+# Observability
+observability:
+  metrics_port: 9000
+  log_level: "INFO"
+  # Fields whose names contain any of these substrings are masked in logs
+  redact_keys: ["key", "secret", "token", "password", "private_key"]
+
+dashboard:
+  enabled: true
+  redis_url: "redis://localhost:6379/0"
+  channel: "bot_dashboard_channel"
