@@ -112,8 +112,10 @@ def test_live_mode_requires_the_audit_trail():
 def test_a_pair_configured_for_an_unknown_chain_is_rejected():
     """A pair on a chain with no DEX contracts can never be quoted, and would
     silently log a warning on every cycle forever."""
+    # Allowlisted tokens on purpose: the token policy gate runs first, so a
+    # made-up ticker here would make this test pass for the wrong reason.
     with pytest.raises(Exception, match="chain|solana"):
         _app(pairs=[PairConfig(
-            base="SOL", quote="USDT", cex_symbol="SOL/USDT",
+            base="WETH", quote="USDT", cex_symbol="ETH/USDT",
             max_slippage_bps=30, max_size_quote=5000,
             dex_chain="solana", dex_pool_fee=500)])

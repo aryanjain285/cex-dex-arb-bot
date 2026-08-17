@@ -17,7 +17,7 @@ from typing import List, Optional, Tuple
 import pytest
 
 from src.core import clock
-from src.core.config import RotationConfig, StrategyConfig
+from src.core.config import RotationConfig, StrategyConfig, TokenPolicyConfig
 from src.core.types import BookSnapshot, DexQuote, MarketPair
 from src.strategy.detector import OpportunityDetector
 
@@ -44,6 +44,10 @@ def strategy(**kw) -> StrategyConfig:
         rotation=RotationConfig(enabled=False),
     )
     defaults.update(kw)
+    # Denylist mode: these tests use invented tickers as neutral
+    # placeholders and are not about the token policy. Opting out here
+    # keeps test symbols out of the production allowlist.
+    defaults.setdefault("token_policy", TokenPolicyConfig(mode="denylist"))
     return StrategyConfig(**defaults)
 
 

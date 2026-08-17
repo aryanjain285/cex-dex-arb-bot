@@ -30,6 +30,87 @@ from .risk.limits import RiskManager
 if uvloop is not None:
     uvloop.install()
 
+
+# Symbols a token registry may spell differently from a pool. Wrapped-native
+# tokens are the only real case: a pool says WETH, the CEX says ETH, and
+# tokens.yaml keys the wrapped contract. Kept explicit rather than as a string
+# replace so it cannot accidentally rewrite an unrelated ticker that merely
+# contains these letters.
+_SYMBOL_ALIASES = {
+    "ETH": ("ETH", "WETH"),
+    "WETH": ("WETH", "ETH"),
+    "BNB": ("BNB", "WBNB"),
+    "WBNB": ("WBNB", "BNB"),
+    "MATIC": ("MATIC", "WMATIC"),
+    "WMATIC": ("WMATIC", "MATIC"),
+    "BTC": ("BTC", "WBTC"),
+    "WBTC": ("WBTC", "BTC"),
+}
+
+
+def _normalise_pool_symbol(symbol: str) -> str:
+    """Fold a pool's token symbol to the form used for comparison.
+
+    Pools carry vendor suffixes (`USDC.e`) and the wrapped-native spelling, so
+    the raw string cannot be compared to a CEX asset name directly.
+    """
+    folded = str(symbol or "").strip().upper().split(".")[0]
+    return "ETH" if folded == "WETH" else folded
+
+
+def _assign_pool_sides(token0: dict, token1: dict, expected_base: str):
+    """Return (base_token, quote_token), or (None, None) if ambiguous.
+
+    Ambiguity is a refusal rather than a coin flip. Two ways it arises, both
+    present in real data: a pool that does not actually contain the expected
+    base, and a pool whose two sides carry the same symbol -- which is what a
+    counterfeit token paired against the real one looks like.
+    """
+    base = _normalise_pool_symbol(expected_base)
+    sym0 = _normalise_pool_symbol(token0.get("symbol"))
+    sym1 = _normalise_pool_symbol(token1.get("symbol"))
+
+    if sym0 == base and sym1 != base:
+        return token0, token1
+    if sym1 == base and sym0 != base:
+        return token1, token0
+    return None, None
+
+
+def _registry_address(config: AppConfig, symbol: str, chain: str) -> Optional[str]:
+    """The address tokens.yaml registers for this symbol on this chain, if any.
+
+    Returns None when the symbol is unregistered, in which case the token policy
+    is the gate: under default-deny an unregistered token is refused anyway, so
+    the two checks meet without a gap between them.
+    """
+    for candidate in _SYMBOL_ALIASES.get(str(symbol).upper(), (str(symbol).upper(),)):
+        details = config.tokens.get(candidate, {}).get(chain)
+        if details is not None and getattr(details, "address", None):
+            return details.address.lower()
+    return None
+
+
+def _address_mismatch(config: AppConfig, chain: str, *sides) -> Optional[str]:
+    """Describe the first symbol whose pool address contradicts the registry.
+
+    Returns None when every registered symbol matches. The registry is
+    authoritative: `config/tokens.yaml` is reviewed and version-controlled,
+    while pool data is whatever a subgraph returned.
+    """
+    for symbol, token in sides:
+        expected = _registry_address(config, symbol, chain)
+        if expected is None:
+            continue
+        actual = str(token.get("address") or "").lower()
+        if actual != expected:
+            return (
+                f"{symbol} on {chain} is registered at {expected} but this pool "
+                f"uses {actual or '(none)'}. A matching ticker with a different "
+                f"address is a different token; refusing to trade it."
+            )
+    return None
+
 class ArbiBotApp:
     def __init__(self, config: AppConfig, mode: str = 'live'):
         self.config = config
@@ -143,7 +224,21 @@ class ArbiBotApp:
             opportunities = data.get("opportunities", [])
             self.logger.info(f"Loaded {len(opportunities)} dynamic opportunities from {discovery_path}.")
 
+            # This file is written unattended by the volume scanner and its
+            # contents go straight to the detector AND the executor, so it is an
+            # auto-promotion path into live trading. The token policy and the
+            # known-chain check are applied here as well as in load_config,
+            # because that function gates a DIFFERENT file
+            # (data/discovered_pairs.yaml) and a gate on one of two paths is not
+            # a gate. The detector refuses a denied pair again per evaluation;
+            # filtering here additionally keeps it out of the pair count an
+            # operator reads as the trading universe, and away from the executor
+            # entirely.
+            token_policy = config.strategy.token_policy.build()
+            known_chains = set(config.dex.uniswap_v3)
+
             skipped = 0
+            blocked = 0
             for opp in opportunities:
                 if not opp.get("dex_candidates"):
                     continue
@@ -155,15 +250,61 @@ class ArbiBotApp:
                     self.logger.warning(f"Skipping opportunity {opp['symbol']} because raw_pool_data is missing.")
                     continue
 
-                # --- Correctly identify token details from raw_pool_data ---
+                # --- Identify which side of the pool is the base ---
                 token0 = raw_pool['token0']
                 token1 = raw_pool['token1']
 
-                # Normalize symbols to correctly identify base/quote
-                token0_norm_sym = token0['symbol'].upper().replace('WETH', 'ETH').split('.')[0]
-                token1_norm_sym = token1['symbol'].upper().replace('WETH', 'ETH').split('.')[0]
+                # The previous form of this line was:
+                #
+                #   base, quote = (token0, token1) \
+                #       if token0_norm_sym == opp["base"] else (token1, token0)
+                #
+                # If NEITHER token matched the expected base, the else branch
+                # silently declared token1 to be the base. The resulting pair
+                # carried the wrong token's address and decimals, so every quote
+                # for it priced a different asset than the CEX symbol it was
+                # being compared against -- with nothing logged.
+                #
+                # Requiring an unambiguous match also happens to be the only
+                # defence against an impostor token, and the shipped dataset
+                # contains one: a Base pool pairing canonical WETH
+                # (0x4200..0006) against a counterfeit token that is ALSO called
+                # WETH (0x71b3..5860), showing $62m of 24h volume on $270k of
+                # TVL. Both sides normalise to the same symbol, so the pool is
+                # ambiguous and is refused here.
+                base_details_raw, quote_details_raw = _assign_pool_sides(
+                    token0, token1, opp["base"]
+                )
+                if base_details_raw is None:
+                    self.logger.warning(
+                        f"Skipping {opp['symbol']}: cannot identify the base "
+                        f"token unambiguously in pool "
+                        f"{candidate.get('pool_address', '?')} "
+                        f"(token0={token0.get('symbol')} "
+                        f"{token0.get('address')}, token1="
+                        f"{token1.get('symbol')} {token1.get('address')}, "
+                        f"expected base {opp['base']!r}). Either the pool does "
+                        f"not contain the pair, or both sides share a symbol -- "
+                        f"which is what an impostor token looks like."
+                    )
+                    blocked += 1
+                    continue
 
-                base_details_raw, quote_details_raw = (token0, token1) if token0_norm_sym == opp["base"] else (token1, token0)
+                # A symbol is not an identity. Where tokens.yaml registers an
+                # address for this symbol on this chain, the pool must use that
+                # exact address; anything else is a different token wearing the
+                # same ticker.
+                mismatch = _address_mismatch(
+                    config, candidate["chain"],
+                    (opp["base"], base_details_raw),
+                    (opp["quote"], quote_details_raw),
+                )
+                if mismatch is not None:
+                    self.logger.warning(
+                        f"Skipping {opp['symbol']}: {mismatch}"
+                    )
+                    blocked += 1
+                    continue
 
                 # --- Authoritative Decimal Lookup ---
                 is_synthetic = raw_pool.get('is_synthetic', False)
@@ -208,6 +349,27 @@ class ArbiBotApp:
                     skipped += 1
                     continue
 
+                # `quote_dex` is the asset actually touched on-chain, which for
+                # a synthetic pair is neither the base nor the CEX quote -- and
+                # is therefore the one most easily overlooked.
+                verdict = token_policy.check(opp["base"], opp["quote"], quote_dex)
+                if not verdict.allowed:
+                    self.logger.warning(
+                        f"Dropping discovered pair {opp['symbol']}: {verdict.reason}"
+                    )
+                    blocked += 1
+                    continue
+
+                if candidate["chain"] not in known_chains:
+                    self.logger.warning(
+                        f"Dropping discovered pair {opp['symbol']}: chain "
+                        f"'{candidate['chain']}' has no dex.uniswap_v3 entry, so "
+                        f"it can never be quoted. Known chains: "
+                        f"{sorted(known_chains)}."
+                    )
+                    blocked += 1
+                    continue
+
                 # Load default strategy params from config for dynamic pairs
                 default_params = config.scanner.volume.default_pair_params
                 pair = MarketPair(
@@ -241,6 +403,14 @@ class ArbiBotApp:
                     f"shipped snapshot predates the decimals field, and "
                     f"defaulting it to 18 is a 10^12 pricing error on any "
                     f"6-decimal token."
+                )
+            if blocked:
+                self.logger.warning(
+                    f"Blocked {blocked} discovered pair(s) on policy grounds "
+                    f"(token not cleared for capital, or an unquotable chain). "
+                    f"This is the scanner proposing pairs no human has reviewed, "
+                    f"which is expected -- review them before adding them to "
+                    f"config/pairs.yaml."
                 )
             return discovered_pairs
         except Exception as e:

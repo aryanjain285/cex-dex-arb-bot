@@ -20,7 +20,7 @@ from decimal import Decimal
 import pytest
 
 from src.core import clock
-from src.core.config import CexConfig, SecretsConfig
+from src.core.config import CexConfig, SecretsConfig, TokenPolicyConfig
 from src.core.types import MarketPair
 
 
@@ -153,7 +153,7 @@ async def test_get_book_returns_none_before_any_frame_arrives(pair):
 def test_default_max_book_age_is_tight_enough_to_detect_a_stall():
     """5.0s permitted five consecutive missed updates on the old 1 Hz stream.
     On a 100ms stream the guard must be far tighter to mean anything."""
-    from src.core.config import StrategyConfig
+    from src.core.config import StrategyConfig, TokenPolicyConfig
 
     assert StrategyConfig().max_book_age_seconds <= 1.0
 
@@ -283,7 +283,10 @@ async def test_detector_rejects_on_feed_staleness_not_symbol_quiet():
                                 feed_timestamp=now - self.feed_age)
 
     cfg = StrategyConfig(target_notional_usd=1000, taker_fee_bps=Decimal("7.5"),
-                         min_net_bps=Decimal(5), max_book_age_seconds=0.5)
+                         min_net_bps=Decimal(5), max_book_age_seconds=0.5,
+                         # This test is about feed staleness, not the token
+                         # policy, and its ticker is a placeholder.
+                         token_policy=TokenPolicyConfig(mode="denylist"))
     dex = FakeDex(sell_price=110, buy_price=110)
 
     quiet = await OpportunityDetector(cfg, Cex(symbol_age=3.0, feed_age=0.1), dex, [pair]).detect()

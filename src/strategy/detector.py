@@ -67,6 +67,11 @@ class RejectionReason:
     BELOW_FLOOR = "below_floor"
     ABOVE_SANITY = "above_sanity"
     NOT_BEST_DIRECTION = "not_best_direction"
+    # A token on this pair is not cleared for capital: fee-on-transfer,
+    # rebasing, or not withdrawable from the CEX. Recorded rather than
+    # silently skipped, so a denial is visible in the dataset instead of
+    # looking like a pair that simply never had an opportunity.
+    TOKEN_DENIED = "token_denied"
     ERROR = "error"
 
 
@@ -111,10 +116,14 @@ class OpportunityDetector:
             DelayedQuoteBuffer(placebo_cfg.delay_cycles)
             if placebo_cfg.enabled else None
         )
+        # Built once. Constructing it per evaluation would put a validation
+        # error in the hot loop, where the only safe response is to keep going.
+        self._token_policy = strategy_config.token_policy.build()
         logger.info(
             f"Opportunity detector initialised, monitoring {len(pairs)} pairs "
             f"({'recording' if store else 'NOT recording'} evaluations)."
         )
+        logger.info(self._token_policy.describe())
         if self._rotation_cost_quote > ZERO:
             logger.info(
                 f"Inventory rotation priced at {self._rotation_cost_quote:.4f} "
@@ -178,7 +187,39 @@ class OpportunityDetector:
         """Kept for callers that only want the opportunity."""
         return await self._evaluate_pair(pair)
 
+    def _pair_symbols(self, pair: MarketPair) -> List[str]:
+        """Every token this pair would move, including the ones not in its name.
+
+        A synthetic pair trades against a third asset on-chain (`quote_dex`) and
+        converts through a fourth CEX symbol (`intermediate_symbol`). Those are
+        the easiest to overlook and just as capable of taking a transfer fee, so
+        they are checked explicitly rather than assumed benign.
+        """
+        symbols = [pair.base, pair.quote_cex, pair.quote_dex]
+        if pair.intermediate_symbol:
+            # e.g. "ETH/USDT" -> both sides
+            symbols.extend(
+                part for part in pair.intermediate_symbol.split("/") if part
+            )
+        # De-duplicated but order-stable, so the rejection message names the
+        # first offending token deterministically.
+        seen, unique = set(), []
+        for symbol in symbols:
+            if symbol and symbol not in seen:
+                seen.add(symbol)
+                unique.append(symbol)
+        return unique
+
     async def _evaluate_pair(self, pair: MarketPair) -> Optional[Opportunity]:
+        # Before any network call. Quoting a token that can never be traded
+        # spends rate limit and adds latency to every other pair in the cycle.
+        verdict = self._token_policy.check(*self._pair_symbols(pair))
+        if not verdict.allowed:
+            logger.warning(f"{pair.cex_symbol} blocked by token policy: {verdict.reason}")
+            self._emit(pair, _Evaluation(
+                direction="", reason=RejectionReason.TOKEN_DENIED))
+            return None
+
         evaluations = (
             await self._evaluate_synthetic(pair)
             if pair.is_synthetic
@@ -565,6 +606,16 @@ class OpportunityDetector:
         """
         econ = ev.econ
 
+        # Recomputed here rather than threaded down from _evaluate_pair. It is a
+        # handful of dict lookups, and deriving it at the point of recording
+        # makes it impossible for the stored label to drift from the pair the row
+        # describes.
+        try:
+            policy_verdict = self._token_policy.classify(*self._pair_symbols(pair))
+        except Exception as exc:  # pragma: no cover - never fatal
+            logger.debug(f"Could not classify {pair.cex_symbol}: {exc}")
+            policy_verdict = None
+
         # Counted regardless of whether a store is configured. This is the
         # series that distinguishes a quiet market from a wedged loop: the
         # most common decision -- rejected below the floor -- previously
@@ -610,6 +661,7 @@ class OpportunityDetector:
                 net_quote=econ.net_quote if econ else None,
                 net_bps=econ.net_bps if econ else None,
                 placebo_net_bps=ev.placebo_net_bps,
+                policy_verdict=policy_verdict,
                 cex_legs=econ.cex_legs if econ else None,
                 book_age_s=ev.book_age_s,
                 depth_levels_used=ev.depth_levels_used,

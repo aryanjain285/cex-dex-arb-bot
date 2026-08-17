@@ -10,7 +10,7 @@ from decimal import Decimal
 
 import pytest
 
-from src.core.config import RotationConfig, StrategyConfig
+from src.core.config import RotationConfig, StrategyConfig, TokenPolicyConfig
 from src.strategy.detector import OpportunityDetector
 from tests.fakes import D, FakeCex, FakeDex, flat_book, make_pair
 
@@ -24,6 +24,10 @@ def strategy(**overrides) -> StrategyConfig:
         rotation=RotationConfig(enabled=False),
     )
     defaults.update(overrides)
+    # Denylist mode: these tests use invented tickers as neutral
+    # placeholders and are not about the token policy. Opting out here
+    # keeps test symbols out of the production allowlist.
+    defaults.setdefault("token_policy", TokenPolicyConfig(mode="denylist"))
     return StrategyConfig(**defaults)
 
 

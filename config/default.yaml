@@ -126,6 +126,36 @@ strategy:
     enabled: true
     delay_cycles: 5             # ~1s at a 0.2s loop interval
 
+  # Which tokens capital may touch.
+  #
+  # Three token properties break this strategy's arithmetic, and none of them is
+  # visible in a price, so none can be caught by the detector:
+  #   - fee-on-transfer: QuoterV2 does not model a transfer tax, so the quote
+  #     overstates what arrives. Taxes run 100-500 bps against a 5 bps target
+  #     edge, which inverts the sign of the trade rather than trimming it.
+  #   - rebasing: balances move with no transfer, so a rebase and a missing fill
+  #     look identical to reconciliation.
+  #   - withdrawals suspended: the token trades on the CEX but cannot leave it,
+  #     so a completed arbitrage strands the float. That is a loss of principal.
+  #
+  # `allowlist` is default-deny. A denylist can only hold hazards someone has
+  # already found, and the expensive token is the one the volume scanner
+  # surfaces unattended. `denylist` mode exists for measurement runs that
+  # deliberately observe the whole market; env: prod refuses it.
+  #
+  # The reviewed hazard registry lives in src/core/config.py, not here, so a
+  # careless edit to this file cannot silently re-permit a known hazard. Use
+  # denied_extra to ADD a denial without a code change; it merges with the
+  # registry and can only ever make the policy stricter.
+  token_policy:
+    mode: allowlist
+    allowed: ["WETH", "ETH", "USDT", "USDC", "ARB"]
+    denied_extra: {}
+    # denied_extra:
+    #   SOMETOKEN:
+    #     risks: ["fee_on_transfer"]     # see TokenRisk for the vocabulary
+    #     note: "observed 2% on transfer on 2026-08-17; tx 0x..."
+
 # CEX settings (testnet)
 # cex:
 #   name: "binance-testnet"

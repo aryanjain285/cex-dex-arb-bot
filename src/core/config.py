@@ -349,6 +349,130 @@ class RotationConfig(BaseModel):
         return self
 
 
+class TokenPolicyConfig(BaseModel):
+    """Which tokens capital is permitted to touch.
+
+    Three token properties break the strategy's arithmetic and none of them is
+    visible in a price, so none can be caught by the detector:
+
+    * fee-on-transfer -- QuoterV2 does not model a transfer tax, so the quote
+      overstates what arrives. Taxes run 100-500 bps against a 5 bps target
+      edge, which inverts the sign of the trade rather than trimming it.
+    * rebasing -- balances move with no transfer, so a rebase and a missing
+      fill look identical to reconciliation.
+    * withdrawals suspended -- the token trades on the CEX but cannot leave it,
+      so a completed arbitrage strands the float on one venue. That is a loss of
+      principal, not a losing trade.
+
+    Defaults to `allowlist` (default-deny) because a denylist can only hold the
+    hazards someone has already found, and the expensive token is the one the
+    volume scanner discovers unattended. `denylist` exists for measurement runs
+    that deliberately observe the whole market; `env: prod` refuses it.
+    """
+
+    mode: str = "allowlist"
+
+    # Tokens cleared for capital. Each has been checked for a transfer fee, for
+    # rebasing, and for CEX withdrawal status.
+    allowed: List[str] = Field(
+        default_factory=lambda: ["WETH", "ETH", "USDT", "USDC", "ARB"]
+    )
+
+    # Known hazards, denied regardless of mode. `risks` uses the fixed
+    # vocabulary in TokenRisk; `note` carries the evidence so a later reader can
+    # audit the entry instead of deleting it as unexplained.
+    denied: Dict[str, Dict[str, Any]] = Field(
+        default_factory=lambda: {
+            "LINGO": {
+                "risks": ["fee_on_transfer"],
+                "note": (
+                    "1.25% transfer fee, invisible to QuoterV2. Sits in the "
+                    "highest-volume Base pool in the scanned dataset, so it is "
+                    "the single most likely token to be auto-discovered."
+                ),
+            },
+            "UST": {
+                "risks": ["withdrawal_suspended"],
+                "note": "Binance withdrawals suspended; inventory cannot leave.",
+            },
+            "LUNA": {
+                "risks": ["withdrawal_suspended"],
+                "note": "Binance withdrawals suspended; inventory cannot leave.",
+            },
+            "LUNC": {
+                "risks": ["withdrawal_suspended"],
+                "note": "Post-collapse ticker; withdrawal status unreliable.",
+            },
+            "FEI": {
+                "risks": ["withdrawal_suspended"],
+                "note": "Protocol wound down; withdrawals unavailable.",
+            },
+            "RENZEC": {
+                "risks": ["withdrawal_suspended", "transfer_restricted"],
+                "note": (
+                    "RenBridge shut down: the token cannot be redeemed, so any "
+                    "inventory is permanently stranded."
+                ),
+            },
+            "SOHM": {
+                "risks": ["rebasing"],
+                "note": (
+                    "Rebases roughly every 8 hours. Balance changes with no "
+                    "transfer, so reconciliation cannot distinguish a rebase "
+                    "from an unfilled leg."
+                ),
+            },
+            "AMPL": {
+                "risks": ["rebasing"],
+                "note": "Daily supply rebase; same accounting problem as sOHM.",
+            },
+            "STA": {
+                "risks": ["fee_on_transfer"],
+                "note": (
+                    "Statera charges 1% on transfer -- the token that drained "
+                    "Balancer pools in 2020 through exactly this mechanism."
+                ),
+            },
+            "PAXG": {
+                "risks": ["fee_on_transfer"],
+                "note": (
+                    "On-chain transfer fee set by the issuer and changeable "
+                    "without notice, so it cannot be modelled from config."
+                ),
+            },
+        }
+    )
+
+    # Operator additions, from YAML. Merged with `denied` above, which stays in
+    # code so a careless config edit -- or a merge that drops a key -- cannot
+    # silently re-permit a reviewed hazard. Config can add a denial; it cannot
+    # remove one. Editing a Python file under time pressure is the more
+    # dangerous of the two operations, so the urgent path is the YAML one.
+    denied_extra: Dict[str, Dict[str, Any]] = Field(default_factory=dict)
+
+    def build(self) -> 'TokenPolicy':
+        """Construct the runtime policy, validating the lists as it goes."""
+        from src.strategy.token_policy import TokenPolicy
+
+        return TokenPolicy(
+            mode=self.mode,
+            allowed=self.allowed,
+            denied={**self.denied, **self.denied_extra},
+        )
+
+    @model_validator(mode='after')
+    def validate_token_policy(self) -> 'TokenPolicyConfig':
+        # Build eagerly so a malformed list fails at config load rather than on
+        # the first evaluation of the pair that happens to reference it.
+        from src.strategy.token_policy import TokenPolicyError
+
+        try:
+            self.build()
+        except TokenPolicyError as exc:
+            raise ValueError(f"strategy.token_policy is unenforceable: {exc}") from exc
+        return self
+
+
 class StrategyConfig(BaseModel):
     """Global strategy parameters.
 
@@ -404,6 +528,11 @@ class StrategyConfig(BaseModel):
     # Control arm: the same CEX book against a deliberately stale DEX
     # quote, to distinguish a real edge from a latency artefact.
     placebo: PlaceboConfig = Field(default_factory=PlaceboConfig)
+
+    # Which tokens capital may touch. Enforced at config load for the
+    # configured pairs and again in the detector for anything discovered
+    # at runtime.
+    token_policy: TokenPolicyConfig = Field(default_factory=TokenPolicyConfig)
 
     @model_validator(mode='after')
     def validate_strategy(self) -> 'StrategyConfig':
@@ -536,6 +665,18 @@ class AppConfig(BaseModel):
                 f"risk control."
             )
 
+        # Every configured pair must be tradeable under the token policy. A
+        # hand-written pairs.yaml entry for a fee-on-transfer token would
+        # otherwise produce a bot whose own arithmetic reports a profit on every
+        # trade while the transfer tax takes more than the entire edge.
+        policy = self.strategy.token_policy.build()
+        for pair in self.pairs:
+            verdict = policy.check(pair.base, pair.quote)
+            if not verdict.allowed:
+                raise ValueError(
+                    f"pair {pair.cex_symbol} is not tradeable: {verdict.reason}"
+                )
+
         # Pairs must be quotable. A pair on a chain with no DEX contracts logs a
         # warning every cycle forever and never trades.
         known_chains = set(self.dex.uniswap_v3)
@@ -559,6 +700,14 @@ class AppConfig(BaseModel):
                     "env: prod requires strategy.rotation.enabled. Disabling it "
                     "asserts that moving inventory between venues is free, which "
                     "is defensible only while measuring in paper mode."
+                )
+            if self.strategy.token_policy.mode != "allowlist":
+                raise ValueError(
+                    "env: prod requires strategy.token_policy.mode == "
+                    "'allowlist'. Denylist mode permits every token nobody has "
+                    "looked at yet, which is a reasonable stance for a "
+                    "measurement run and an unreasonable one for capital: a "
+                    "denylist can only contain hazards already discovered."
                 )
             if not self.observability.evaluation_store_enabled:
                 raise ValueError(
@@ -615,6 +764,20 @@ def load_config(
             logger.warning("Dynamic pairs file has the wrong shape; expected a list.")
             return config
 
+        # Discovered pairs are appended AFTER pydantic has finished validating
+        # AppConfig, so none of the cross-checks in validate_coherence apply to
+        # them -- and these are the pairs with the least human scrutiny, since
+        # the volume scanner writes this file unattended and app.py feeds it
+        # straight to the detector and the executor.
+        #
+        # The asymmetry against config/pairs.yaml is deliberate. A hand-written
+        # pair is a statement of intent, so a hazard there stops the process. A
+        # discovered pair is machine output, so a hazard is dropped with a
+        # warning and the run continues: refusing to start would let one bad
+        # discovery take the whole system offline.
+        policy = config.strategy.token_policy.build()
+        known_chains = set(config.dex.uniswap_v3)
+
         existing_symbols: Set[str] = {p.cex_symbol for p in config.pairs}
         for entry in raw_pairs:
             if not isinstance(entry, dict):
@@ -635,8 +798,29 @@ def load_config(
 
             if pair_cfg.cex_symbol in existing_symbols:
                 continue
+
+            verdict = policy.check(pair_cfg.base, pair_cfg.quote)
+            if not verdict.allowed:
+                logger.warning(
+                    f"Dropping discovered pair {pair_cfg.cex_symbol}: "
+                    f"{verdict.reason}"
+                )
+                continue
+
+            if pair_cfg.dex_chain not in known_chains:
+                logger.warning(
+                    f"Dropping discovered pair {pair_cfg.cex_symbol}: chain "
+                    f"'{pair_cfg.dex_chain}' has no dex.uniswap_v3 entry, so it "
+                    f"can never be quoted. Known chains: {sorted(known_chains)}."
+                )
+                continue
+
             config.pairs.append(pair_cfg)
             existing_symbols.add(pair_cfg.cex_symbol)
+            logger.info(
+                f"Accepted discovered pair {pair_cfg.cex_symbol} on "
+                f"{pair_cfg.dex_chain}."
+            )
 
     return config
 

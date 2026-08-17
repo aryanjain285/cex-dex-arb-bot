@@ -15,7 +15,7 @@ from decimal import Decimal
 
 import pytest
 
-from src.core.config import RotationConfig, StrategyConfig
+from src.core.config import RotationConfig, StrategyConfig, TokenPolicyConfig
 from src.core.types import BookSnapshot, MarketPair
 from src.strategy.detector import OpportunityDetector, RejectionReason
 from tests.fakes import D, FakeCex, FakeDex, flat_book, make_pair
@@ -32,6 +32,10 @@ def strategy(**kw) -> StrategyConfig:
             float_quote=5000.0, transfer_risk_bps=10.0),
     )
     defaults.update(kw)
+    # Denylist mode: these tests use invented tickers as neutral
+    # placeholders and are not about the token policy. Opting out here
+    # keeps test symbols out of the production allowlist.
+    defaults.setdefault("token_policy", TokenPolicyConfig(mode="denylist"))
     return StrategyConfig(**defaults)
 
 

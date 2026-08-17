@@ -35,7 +35,7 @@ from loguru import logger
 __all__ = ["SCHEMA_VERSION", "EvaluationRecord", "EvaluationStore"]
 
 # Bump when the column set changes so old rows stay interpretable.
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 # Columns holding exact decimal quantities. Stored as TEXT, never REAL.
 _DECIMAL_COLUMNS = (
@@ -98,6 +98,11 @@ class EvaluationRecord:
     depth_levels_used: Optional[int] = None
     min_net_bps: Optional[Decimal] = None
     taker_fee_bps: Optional[Decimal] = None
+    # Mode-independent token-policy label: "allowed", "not_allowlisted" or
+    # "denied". Recorded on every row so a broad measurement run still
+    # yields an honest tradeable subset, instead of mixing real edges with a
+    # fee-on-transfer token's transfer tax appearing as one.
+    policy_verdict: Optional[str] = None
 
 
 _RECORD_COLUMNS = [f.name for f in fields(EvaluationRecord)]
@@ -143,7 +148,8 @@ CREATE TABLE IF NOT EXISTS evaluations (
     book_age_s        REAL,
     depth_levels_used INTEGER,
     min_net_bps       TEXT,
-    taker_fee_bps     TEXT
+    taker_fee_bps     TEXT,
+    policy_verdict    TEXT
 );
 -- A replayed or double-recorded evaluation would bias every count-based
 -- statistic drawn from the dataset, so identical rows are refused.

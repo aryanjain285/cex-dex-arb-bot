@@ -16,7 +16,7 @@ from decimal import Decimal
 
 import pytest
 
-from src.core.config import StrategyConfig
+from src.core.config import StrategyConfig, TokenPolicyConfig
 from src.strategy.detector import OpportunityDetector
 from tests.fakes import D, FakeCex, FakeDex, flat_book, make_pair
 
@@ -28,6 +28,10 @@ INT_ASK = D(1910)
 def strategy(**kw) -> StrategyConfig:
     defaults = dict(target_notional_usd=1000, taker_fee_bps=D("7.5"), min_net_bps=D(5))
     defaults.update(kw)
+    # Denylist mode: these tests use invented tickers as neutral
+    # placeholders and are not about the token policy. Opting out here
+    # keeps test symbols out of the production allowlist.
+    defaults.setdefault("token_policy", TokenPolicyConfig(mode="denylist"))
     return StrategyConfig(**defaults)
 
 
