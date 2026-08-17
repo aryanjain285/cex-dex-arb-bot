@@ -213,3 +213,41 @@ def test_markout_reports_none_when_no_observation_is_near_the_offset(store):
 
     ladder = store.markout(anchor, offsets_seconds=[1.0], tolerance=0.25)
     assert ladder[1.0] is None
+
+
+# --------------------------------------------------------------------------
+# Hardening. The store's central promise is exact decimal fidelity; these
+# guard the ways that promise was silently breakable.
+# --------------------------------------------------------------------------
+
+def test_float_in_a_decimal_column_is_rejected(store: EvaluationStore):
+    """A single careless caller must not be able to reintroduce IEEE-754.
+
+    The Decimal-as-TEXT discipline was documented but unenforced: passing a
+    float persisted its binary artifact verbatim ('0.30000000000000004'),
+    which is exactly the corruption the design exists to prevent.
+    """
+    with pytest.raises(TypeError, match="size_base"):
+        store.record(taken_record(size_base=0.1 + 0.2))
+
+
+def test_int_in_a_decimal_column_is_accepted_and_exact(store: EvaluationStore):
+    """Ints are lossless, so they are allowed -- only floats are dangerous."""
+    store.record(taken_record(size_base=5))
+    assert Decimal(store.all_rows()[0]["size_base"]) == D(5)
+
+
+def test_identical_records_are_rejected_as_duplicates(store: EvaluationStore):
+    """A replay or a double-record must not silently inflate the dataset,
+    which would bias every count-based statistic drawn from it."""
+    record = taken_record(ts=1_700_000_500.0, direction="CEX_to_DEX")
+    store.record(record)
+    with pytest.raises(Exception):
+        store.record(record)
+
+
+def test_synchronous_is_full_for_durability(store: EvaluationStore):
+    """An audit trail must survive OS crash and power loss, not merely
+    process death. Under WAL, synchronous=NORMAL does not fsync commits."""
+    mode = store._conn.execute("PRAGMA synchronous").fetchone()[0]
+    assert mode == 2, f"expected synchronous=FULL (2), got {mode}"

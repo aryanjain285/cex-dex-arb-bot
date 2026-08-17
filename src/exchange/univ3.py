@@ -289,7 +289,7 @@ class UniV3DexClient(DexClient):
         )
         
         signed_tx = w3.eth.account.sign_transaction(approve_tx, self.secrets.dex_wallet_private_key.get_secret_value())
-        tx_hash = await asyncio.to_thread(w3.eth.send_raw_transaction, signed_tx.rawTransaction)
+        tx_hash = await asyncio.to_thread(w3.eth.send_raw_transaction, signed_tx.raw_transaction)
         logger.info(f"Approval transaction sent: {tx_hash.hex()}")
         
         receipt = await asyncio.to_thread(w3.eth.wait_for_transaction_receipt, tx_hash, timeout=self.net_config.max_pending_seconds)
@@ -338,7 +338,7 @@ class UniV3DexClient(DexClient):
                 router_contract.functions.exactInputSingle(swap_params_struct).build_transaction, tx_params
             )
             signed_tx = w3.eth.account.sign_transaction(swap_tx, self.secrets.dex_wallet_private_key.get_secret_value())
-            tx_hash = await asyncio.to_thread(w3.eth.send_raw_transaction, signed_tx.rawTransaction)
+            tx_hash = await asyncio.to_thread(w3.eth.send_raw_transaction, signed_tx.raw_transaction)
             logger.info(f"DEX swap transaction sent: {tx_hash.hex()}")
 
             receipt = await asyncio.to_thread(w3.eth.wait_for_transaction_receipt, tx_hash, timeout=self.net_config.max_pending_seconds)

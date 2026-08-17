@@ -63,4 +63,4 @@ pairs:
     price_ceiling_quote: 100
     max_edge_bps: 1000
     base_precision: 1         # stepSize = 0.1
-    quote_precision: 3        # tickSize = 0.001
+    quote_precision: 4        # tickSize = 0.0001 (verified live)

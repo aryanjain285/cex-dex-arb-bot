@@ -127,6 +127,10 @@ CREATE TABLE IF NOT EXISTS evaluations (
     min_net_bps       TEXT,
     taker_fee_bps     TEXT
 );
+-- A replayed or double-recorded evaluation would bias every count-based
+-- statistic drawn from the dataset, so identical rows are refused.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_eval_unique
+    ON evaluations (run_id, ts, cex_symbol, direction, outcome);
 CREATE INDEX IF NOT EXISTS idx_eval_symbol_ts ON evaluations (cex_symbol, ts);
 CREATE INDEX IF NOT EXISTS idx_eval_run       ON evaluations (run_id);
 CREATE INDEX IF NOT EXISTS idx_eval_outcome   ON evaluations (outcome, ts);
@@ -140,21 +144,38 @@ class EvaluationStore:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._conn = sqlite3.connect(str(self.path), isolation_level=None)
         self._conn.row_factory = sqlite3.Row
-        # WAL: durable across process death, and readers never block the writer,
-        # so the dataset can be queried while a run is in progress.
+        # WAL so readers never block the writer, and the dataset can be
+        # queried while a run is in progress.
         self._conn.execute("PRAGMA journal_mode=WAL")
-        self._conn.execute("PRAGMA synchronous=NORMAL")
+        # FULL, not NORMAL: under WAL, NORMAL does not fsync commits, so an
+        # OS crash or power loss can lose recent rows. An audit trail must
+        # survive more than process death.
+        self._conn.execute("PRAGMA synchronous=FULL")
         self._conn.executescript(_CREATE_TABLE)
         logger.info(f"Evaluation store open at {self.path} (run_id={run_id}).")
 
     # ------------------------------------------------------------------
 
     def record(self, record: EvaluationRecord) -> int:
-        """Persist one evaluation. Returns its row id."""
+        """Persist one evaluation. Returns its row id.
+
+        Raises TypeError if any money field was passed as a float. The
+        Decimal-as-TEXT discipline is the store's central guarantee, and it was
+        previously documented but unenforced -- a single careless caller could
+        persist an IEEE-754 artifact (0.1 + 0.2 became '0.30000000000000004'),
+        silently reintroducing into the audit trail exactly the imprecision the
+        design exists to exclude. Enforced here rather than trusted.
+        """
         payload = asdict(record)
         for column in _DECIMAL_COLUMNS:
             value = payload.get(column)
-            # str() on a Decimal is exact and losslessly reversible.
+            if isinstance(value, float):
+                raise TypeError(
+                    f"{column} must be a Decimal or int, not float "
+                    f"(got {value!r}). Floats cannot represent decimal money "
+                    f"exactly; wrap it as Decimal(str(value)) at the source."
+                )
+            # str() on a Decimal or int is exact and losslessly reversible.
             payload[column] = None if value is None else str(value)
         payload["is_synthetic"] = 1 if record.is_synthetic else 0
         payload["run_id"] = self.run_id
@@ -191,14 +212,23 @@ class EvaluationStore:
     ) -> Dict[float, Optional[Decimal]]:
         """Net edge for the same pair at each offset after the anchor row.
 
+        Matched on the same pair AND the same direction AND the same run.
+        Filtering on direction is essential: both directions of a pair are
+        evaluated in the same cycle and land milliseconds apart, so a
+        symbol-only match would happily return the opposite direction's row --
+        whose net_bps is roughly the negative of the anchor's, turning the
+        decay curve into a coin flip on intra-cycle write order.
+
         For each offset, the observation closest to `anchor.ts + offset` is
-        used, provided it falls within `tolerance` seconds. Offsets with no
+        used, provided it falls within `tolerance` seconds. Ties break on `id`
+        so the result is deterministic rather than dependent on SQLite's
+        row ordering. Offsets with no
         nearby observation return None rather than the nearest available row,
         because silently substituting a distant sample would misrepresent how
         fast the edge decayed -- which is the entire question markout answers.
         """
         anchor = self._conn.execute(
-            "SELECT ts, cex_symbol, direction FROM evaluations WHERE id = ?",
+            "SELECT ts, cex_symbol, direction, run_id FROM evaluations WHERE id = ?",
             (evaluation_id,),
         ).fetchone()
         if anchor is None:
@@ -211,14 +241,18 @@ class EvaluationStore:
                 """
                 SELECT net_bps, ts FROM evaluations
                 WHERE cex_symbol = ?
+                  AND direction IS ?
+                  AND run_id = ?
                   AND id != ?
                   AND ts BETWEEN ? AND ?
                   AND net_bps IS NOT NULL
-                ORDER BY ABS(ts - ?) ASC
+                ORDER BY ABS(ts - ?) ASC, id ASC
                 LIMIT 1
                 """,
                 (
                     anchor["cex_symbol"],
+                    anchor["direction"],
+                    anchor["run_id"],
                     evaluation_id,
                     target - tolerance,
                     target + tolerance,

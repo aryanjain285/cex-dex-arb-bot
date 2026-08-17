@@ -61,13 +61,24 @@ class FakeDex:
     given a quote-currency amount rather than a base amount.
     """
 
-    def __init__(self, sell_price, buy_price, gas=D(0)):
+    def __init__(self, sell_price, buy_price, gas=D(0), impact_bps_per_unit=D(0)):
         self.sell_price = D(sell_price)
         self.buy_price = D(buy_price)
         self.gas = D(gas)
+        # Price impact per unit of size, in basis points. Zero by default so
+        # existing fixtures stay flat, but available so that tests can exercise
+        # a size-dependent DEX price -- which is the core economic mechanism
+        # and was previously untested, because this fake ignored `size`.
+        self.impact_bps_per_unit = D(impact_bps_per_unit)
         self.requests: List[Tuple[str, Decimal]] = []
 
     async def get_quote(self, pair, size, side, estimate_gas=False):
         self.requests.append((side, size))
-        price = self.sell_price if side == "sell" else self.buy_price
+        base = self.sell_price if side == "sell" else self.buy_price
+        if self.impact_bps_per_unit == 0:
+            return DexQuote(price=base, gas_cost_quote=self.gas)
+        # Impact always moves the price against the taker: a seller receives
+        # less, a buyer pays more.
+        adjustment = self.impact_bps_per_unit * D(size) / D(10000)
+        price = base * (1 - adjustment) if side == "sell" else base * (1 + adjustment)
         return DexQuote(price=price, gas_cost_quote=self.gas)

@@ -30,7 +30,7 @@ Honest state of the codebase, so you know what you're building on.
 | Synthetic (triangular) pair pricing | Working |
 | Paper trading mode | Working |
 | Prometheus metrics / Redis dashboard | Working |
-| Test suite | 16/16 passing |
+| Test suite | see `pytest tests/ -q` |
 
 ### Not yet implemented
 

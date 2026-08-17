@@ -1,5 +1,5 @@
 # Core
-web3
+web3==7.16.0
 ccxt==4.3.45
 pydantic==2.7.1
 python-dotenv==1.0.1

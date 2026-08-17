@@ -26,7 +26,7 @@ class Rebalancer:
         
         pair_config = list(self.pairs_config.values())[0]
         base_asset = pair_config.base
-        quote_asset = pair_config.quote_cex # Use the CEX quote symbol
+        quote_asset = pair_config.quote  # PairConfig names this `quote`
         market_pair = MarketPair(
             base=base_asset,
             quote_cex=quote_asset,
@@ -81,7 +81,7 @@ class Rebalancer:
             try:
                 order = CexOrder(pair=market_pair, side=side, type="MARKET", size=amount_to_trade, price=Decimal(0), order_id="", ts=0)
                 update = await self.cex_client.create_order(order)
-                if update.status == "FILLED":
+                if update.status == "filled":
                     logger.success("Rebalance trade succeeded.")
                 else:
                     logger.error(f"Rebalance trade failed, order status: {update.status}")
