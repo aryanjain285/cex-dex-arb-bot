@@ -37,6 +37,7 @@ from src.exchange.dex_base import DexClient
 from src.infra.evaluation_store import EvaluationRecord
 from src.infra import metrics
 from src.infra.metrics import opportunities_found
+from src.exchange.errors import RpcError
 from src.exchange.pool_selector import PoolSelector
 from src.strategy.placebo import DelayedQuoteBuffer
 from src.strategy.costs import (
@@ -73,6 +74,11 @@ class RejectionReason:
     # silently skipped, so a denial is visible in the dataset instead of
     # looking like a pair that simply never had an opportunity.
     TOKEN_DENIED = "token_denied"
+    # The chain node did not answer -- throttled, timed out, or down. A
+    # DIFFERENT fact from no_dex_quote: that one means the pool is empty and
+    # the pair should be dropped, this one means slow down or buy a better
+    # node. Collapsing them made a throttled bot look like an empty market.
+    RPC_ERROR = "rpc_error"
     ERROR = "error"
 
 
@@ -362,9 +368,14 @@ class OpportunityDetector:
             ev.reason = RejectionReason.INSUFFICIENT_DEPTH
             return ev
 
-        quote = await self.dex_client.get_quote(
-            quoting_pair, size=fill.filled_base, side="sell", estimate_gas=True
-        )
+        try:
+            quote = await self.dex_client.get_quote(
+                quoting_pair, size=fill.filled_base, side="sell", estimate_gas=True
+            )
+        except RpcError as exc:
+            logger.warning(f"{pair.cex_symbol} CEX_to_DEX: {exc}")
+            ev.reason = RejectionReason.RPC_ERROR
+            return ev
         if quote is None or quote.price <= ZERO:
             ev.reason = RejectionReason.NO_DEX_QUOTE
             return ev
@@ -413,9 +424,14 @@ class OpportunityDetector:
         # amount. For a direct pair that is the target notional; for a
         # synthetic pair the caller converts it into the intermediate asset.
         spend = notional if dex_spend is None else dex_spend
-        quote = await self.dex_client.get_quote(
-            quoting_pair, size=spend, side="buy", estimate_gas=True
-        )
+        try:
+            quote = await self.dex_client.get_quote(
+                quoting_pair, size=spend, side="buy", estimate_gas=True
+            )
+        except RpcError as exc:
+            logger.warning(f"{pair.cex_symbol} DEX_to_CEX: {exc}")
+            ev.reason = RejectionReason.RPC_ERROR
+            return ev
         if quote is None or quote.price <= ZERO:
             ev.reason = RejectionReason.NO_DEX_QUOTE
             return ev

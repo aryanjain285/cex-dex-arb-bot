@@ -16,6 +16,7 @@ from ..core.config import DexConfig, NetworkConfig, SecretsConfig, TokenDetails
 from .price_oracle import NativePriceOracle
 from ..core.types import MarketPair, DexQuote, DexSwapParams, DexTxReceipt
 from .dex_base import DexClient
+from .errors import RpcError, classify_rpc_failure
 
 TEN_THOUSAND = Decimal("10000")
 
@@ -154,6 +155,49 @@ class UniV3DexClient(DexClient):
         if symbol not in self.tokens_config or chain not in self.tokens_config[symbol]:
             raise ValueError(f"No address configured for token {symbol} on chain {chain}.")
         return self.tokens_config[symbol][chain]
+
+    async def get_pool_address_by_tokens(
+        self, token_a_address: str, token_b_address: str, chain: str, fee: int
+    ) -> Optional[str]:
+        """Pool address for two token ADDRESSES, or None.
+
+        The factory only ever needed addresses; requiring symbols meant a pool
+        could not be found for a token absent from `tokens.yaml`, which made
+        surveying a universe wider than the configured one impossible. Ordering
+        does not matter -- the factory sorts internally.
+        """
+        try:
+            factory = self._get_factory_contract(chain)
+        except ValueError as exc:
+            logger.debug(f"Failed to access the factory contract: {exc}")
+            return None
+
+        try:
+            token_a = Web3.to_checksum_address(token_a_address)
+            token_b = Web3.to_checksum_address(token_b_address)
+        except Exception as exc:
+            logger.debug(f"Bad token address in a pool lookup: {exc}")
+            return None
+
+        def _call() -> str:
+            return factory.functions.getPool(token_a, token_b, int(fee)).call()
+
+        try:
+            pool_address = await asyncio.to_thread(_call)
+        except Exception as exc:
+            if classify_rpc_failure(exc):
+                # Surfaced rather than swallowed: a throttled lookup reported as
+                # "no pool" would permanently exclude a pool that does exist.
+                raise RpcError(f"{chain}: {type(exc).__name__}: {exc}") from exc
+            logger.debug(
+                f"Uniswap pool lookup failed ({token_a}/{token_b} {chain} "
+                f"fee={fee}): {exc}"
+            )
+            return None
+
+        if pool_address and int(pool_address, 16) != 0:
+            return Web3.to_checksum_address(pool_address)
+        return None
 
     async def get_pool_address(self, base_symbol: str, quote_symbol: str, chain: str, fee: int) -> Optional[str]:
         """Return the pool address for the given token pair and fee tier if it exists."""
@@ -303,6 +347,18 @@ class UniV3DexClient(DexClient):
             return DexQuote(price=price, gas_cost_quote=gas_cost_quote)
 
         except Exception as e:
+            # A node that did not answer is a different fact from a pool with no
+            # liquidity, and collapsing both into None made them the same row in
+            # the audit trail. Under RPC pressure the bot would appear to be
+            # watching an empty market.
+            if classify_rpc_failure(e):
+                logger.warning(
+                    f"RPC failure quoting {pair.cex_symbol} on {pair.dex_chain}: "
+                    f"{type(e).__name__}: {e}"
+                )
+                raise RpcError(
+                    f"{pair.dex_chain}: {type(e).__name__}: {e}"
+                ) from e
             logger.warning(f"Error fetching a quote from QuoterV2 ({pair.cex_symbol} on {pair.dex_chain}): {e}")
             return None
 
