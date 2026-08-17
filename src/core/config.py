@@ -271,6 +271,40 @@ class ScannerConfig(BaseModel):
     auto_discovery: Optional[AutoDiscoveryConfig] = None
 
 
+class PlaceboConfig(BaseModel):
+    """A control arm for the edge measurement.
+
+    Markout computed from later rows re-samples both venues, so it measures
+    whether the detector would still fire rather than whether the trade was
+    worth anything. If the whole apparent edge were a stale CEX book, the decay
+    curve would look identical to a real, decaying arbitrage.
+
+    The control: evaluate the same CEX book against a DEX quote from
+    `delay_cycles` cycles ago. Under the null -- the edge is a staleness
+    artefact -- the placebo distribution matches the live one. Divergence is the
+    evidence that the edge is real.
+
+    Costs nothing extra: the delayed quote was already fetched.
+    """
+
+    enabled: bool = True
+
+    # How many detection cycles to delay the DEX quote by. At the default
+    # loop_interval_seconds of 0.2, 5 cycles is roughly one second -- the same
+    # order as a block time, so the placebo asks "would a one-second-old view
+    # have produced this edge too?"
+    delay_cycles: int = 5
+
+    @model_validator(mode='after')
+    def validate_placebo(self) -> 'PlaceboConfig':
+        if self.enabled and self.delay_cycles < 1:
+            raise ValueError(
+                "placebo.delay_cycles must be at least 1; a zero delay is the "
+                "live arm, not a control"
+            )
+        return self
+
+
 class RotationConfig(BaseModel):
     """Cost of moving inventory back between venues.
 
@@ -366,6 +400,10 @@ class StrategyConfig(BaseModel):
 
     # Inventory rotation cost, amortised into every trade's economics.
     rotation: RotationConfig = Field(default_factory=RotationConfig)
+
+    # Control arm: the same CEX book against a deliberately stale DEX
+    # quote, to distinguish a real edge from a latency artefact.
+    placebo: PlaceboConfig = Field(default_factory=PlaceboConfig)
 
     @model_validator(mode='after')
     def validate_strategy(self) -> 'StrategyConfig':

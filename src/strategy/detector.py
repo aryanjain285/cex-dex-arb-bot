@@ -37,6 +37,7 @@ from src.exchange.dex_base import DexClient
 from src.infra.evaluation_store import EvaluationRecord
 from src.infra import metrics
 from src.infra.metrics import opportunities_found
+from src.strategy.placebo import DelayedQuoteBuffer
 from src.strategy.costs import (
     BookFill,
     TradeEconomics,
@@ -86,6 +87,7 @@ class _Evaluation:
     cex_best_ask: Optional[Decimal] = None
     depth_levels_used: Optional[int] = None
     book_age_s: Optional[float] = None
+    placebo_net_bps: Optional[Decimal] = None
 
 
 class OpportunityDetector:
@@ -104,6 +106,11 @@ class OpportunityDetector:
         self.store = store
         self._intermediate_price_cache: Dict[str, Tuple[Tuple[Decimal, Decimal], float]] = {}
         self._rotation_cost_quote = self._compute_rotation_cost()
+        placebo_cfg = strategy_config.placebo
+        self._placebo = (
+            DelayedQuoteBuffer(placebo_cfg.delay_cycles)
+            if placebo_cfg.enabled else None
+        )
         logger.info(
             f"Opportunity detector initialised, monitoring {len(pairs)} pairs "
             f"({'recording' if store else 'NOT recording'} evaluations)."
@@ -292,6 +299,13 @@ class OpportunityDetector:
         )
         if ev.econ is None:
             ev.reason = RejectionReason.BAD_INPUTS
+
+        ev.placebo_net_bps = self._placebo_net_bps(
+            pair, "sell", quote.price, dex_price_scale,
+            direction="CEX_to_DEX", size_base=fill.filled_base,
+            cex_price=fill.vwap, gas_quote=quote.gas_cost_quote,
+            cex_legs=cex_legs,
+        )
         return ev
 
     async def _eval_dex_to_cex(
@@ -341,6 +355,13 @@ class OpportunityDetector:
         )
         if ev.econ is None:
             ev.reason = RejectionReason.BAD_INPUTS
+
+        ev.placebo_net_bps = self._placebo_net_bps(
+            pair, "buy", quote.price, dex_price_scale,
+            direction="DEX_to_CEX", size_base=base_out,
+            cex_price=fill.vwap, gas_quote=quote.gas_cost_quote,
+            cex_legs=cex_legs,
+        )
         return ev
 
     # ------------------------------------------------------------------
@@ -440,6 +461,53 @@ class OpportunityDetector:
         except ValueError as exc:
             logger.debug(f"{pair.cex_symbol} {direction}: rejected inputs: {exc}")
             return None
+
+
+    def _placebo_net_bps(
+        self, pair: MarketPair, side: str, live_dex_price: Decimal,
+        dex_price_scale: Decimal, *, direction: str, size_base: Decimal,
+        cex_price: Decimal, gas_quote: Decimal, cex_legs: int,
+    ) -> Optional[Decimal]:
+        """Net edge this same book would show against a stale DEX quote.
+
+        The live CEX side is held fixed and only the DEX quote is aged, which
+        isolates the question: would a deliberately worse view of the DEX have
+        produced the same edge? If so, the edge is a property of the delay
+        rather than of the market.
+
+        Returns None until the buffer is warm. Substituting the live quote in
+        the meantime would make the control silently agree with the live arm.
+
+        Two deliberate simplifications, stated so the numbers are not read as
+        more than they are:
+
+        * Size is held at the live size rather than re-derived from the stale
+          price. Re-deriving would change the CEX depth consumed too, mixing a
+          size effect into what is meant to isolate a price effect.
+        * "N cycles ago" counts cycles that produced a quote, not wall-clock
+          cycles. A cycle rejected before the DEX call pushes nothing, so the
+          delay is measured in observations rather than in seconds. That is the
+          comparison that matters -- both arms are then real observations of the
+          same venue -- but it means the lag is not a fixed duration.
+        """
+        if self._placebo is None:
+            return None
+
+        # Push before reading. The buffer's contract is "the quote from
+        # delay_cycles pushes ago", so on cycle N the live quote must already be
+        # in the series for the read to land on cycle N - delay_cycles. Reading
+        # first would silently return the quote from delay_cycles + 1 ago.
+        self._placebo.push(pair.cex_symbol, side, live_dex_price)
+        stale = self._placebo.delayed(pair.cex_symbol, side)
+        if stale is None:
+            return None
+
+        econ = self._economics(
+            pair, direction=direction, size_base=size_base,
+            cex_price=cex_price, dex_price=stale * dex_price_scale,
+            gas_quote=gas_quote, cex_legs=cex_legs,
+        )
+        return econ.net_bps if econ is not None else None
 
     def _floor_for(self, pair: MarketPair) -> Decimal:
         return (
@@ -541,6 +609,7 @@ class OpportunityDetector:
                 rotation_cost_quote=econ.rotation_cost_quote if econ else None,
                 net_quote=econ.net_quote if econ else None,
                 net_bps=econ.net_bps if econ else None,
+                placebo_net_bps=ev.placebo_net_bps,
                 cex_legs=econ.cex_legs if econ else None,
                 book_age_s=ev.book_age_s,
                 depth_levels_used=ev.depth_levels_used,

@@ -107,6 +107,92 @@ async def test_prices_are_tracked_per_chain():
     assert await oracle.get_usd_price("bsc") == D(600)
 
 
+class FakeClock:
+    """A clock the test drives, so window boundaries are exact.
+
+    Both boundary tests below were previously untestable and the two
+    zero-window tests passed only when the wall clock happened to tick between
+    two awaits that do no I/O. On a fast clock they failed -- and the defect
+    they exposed was real: an inclusive comparison meant `ttl_seconds=0` still
+    served from cache and `stale_grace_seconds=0` still served a stale price.
+    """
+
+    def __init__(self, t: float = 1_000.0):
+        self.t = t
+
+    def __call__(self) -> float:
+        return self.t
+
+    def advance(self, seconds: float) -> None:
+        self.t += seconds
+
+
+async def test_the_ttl_boundary_is_exclusive():
+    """At exactly the TTL the price is refetched, not served from cache.
+
+    An inclusive boundary makes `ttl_seconds` mean "up to and including", which
+    is indistinguishable from `ttl + one clock tick` and makes a zero TTL a
+    no-op.
+    """
+    clk = FakeClock()
+    fetcher = Fetcher(D(2500), D(2600))
+    oracle = NativePriceOracle(ttl_seconds=10, fetcher=fetcher, now_fn=clk)
+
+    assert await oracle.get_usd_price("ethereum") == D(2500)
+
+    clk.advance(9.999)
+    assert await oracle.get_usd_price("ethereum") == D(2500)
+    assert fetcher.calls == 1, "just inside the TTL must still be cached"
+
+    clk.advance(0.001)  # now exactly 10.0s old
+    assert await oracle.get_usd_price("ethereum") == D(2600)
+    assert fetcher.calls == 2, "at exactly the TTL the price must be refetched"
+
+
+async def test_the_grace_boundary_is_exclusive():
+    clk = FakeClock()
+    fetcher = Fetcher(D(2500), RuntimeError("blip"), RuntimeError("blip"))
+    oracle = NativePriceOracle(
+        ttl_seconds=0, fetcher=fetcher, stale_grace_seconds=30, now_fn=clk
+    )
+
+    assert await oracle.get_usd_price("ethereum") == D(2500)
+
+    clk.advance(29.999)
+    assert await oracle.get_usd_price("ethereum") == D(2500), "inside grace"
+
+    clk.advance(0.001)  # exactly 30.0s old
+    assert await oracle.get_usd_price("ethereum") is None, (
+        "at exactly the grace boundary a stale price must be refused"
+    )
+
+
+async def test_a_zero_ttl_never_serves_from_cache_even_within_one_tick():
+    """The regression guard for the boundary defect, with time frozen.
+
+    Freezing the clock is the strongest form of this test: it removes the only
+    thing that used to make the old code pass.
+    """
+    clk = FakeClock()
+    fetcher = Fetcher(D(2500), D(2600))
+    oracle = NativePriceOracle(ttl_seconds=0, fetcher=fetcher, now_fn=clk)
+
+    assert await oracle.get_usd_price("ethereum") == D(2500)
+    assert await oracle.get_usd_price("ethereum") == D(2600)
+    assert fetcher.calls == 2
+
+
+async def test_a_zero_grace_window_never_serves_stale_even_within_one_tick():
+    clk = FakeClock()
+    oracle = NativePriceOracle(
+        ttl_seconds=0, fetcher=Fetcher(D(2500), RuntimeError("blip")),
+        stale_grace_seconds=0, now_fn=clk,
+    )
+
+    assert await oracle.get_usd_price("ethereum") == D(2500)
+    assert await oracle.get_usd_price("ethereum") is None
+
+
 async def test_no_hardcoded_fallback_constant_exists_in_the_module():
     """Guards against the fallback being reintroduced.
 

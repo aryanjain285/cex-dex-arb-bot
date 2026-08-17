@@ -47,10 +47,33 @@ jobs:
           cache: pip
 
       - name: Install dependencies
+        # From the lockfile, not requirements.txt. requirements.txt pins only
+        # direct dependencies, and an unpinned transitive one has already broken
+        # the build: click 8.4 resolved against the pinned typer 0.12.3, and
+        # every CLI command -- including --help -- raised at import time. The
+        # same requirements.txt produced a working environment one month and a
+        # dead one the next. A lockfile makes that failure mode impossible.
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          pip install -r requirements.lock
           pip install coverage
+
+      - name: Confirm the lockfile still satisfies requirements.txt
+        # A dependency added to requirements.txt without regenerating the lock
+        # would silently not be installed, and the failure would surface as a
+        # confusing ImportError rather than as "you forgot to relock".
+        run: |
+          pip install uv
+          # --no-header keeps the output byte-identical regardless of the output
+          # path, so this diff tests the dependency set and nothing else.
+          uv pip compile --universal --no-header --python-version 3.11 \
+            -o /tmp/requirements.check requirements.txt
+          if ! diff -u requirements.lock /tmp/requirements.check; then
+            echo "::error::requirements.lock is stale. Regenerate it with:"
+            echo "  uv pip compile --universal --no-header --python-version 3.11 -o requirements.lock requirements.txt"
+            exit 1
+          fi
+          echo "lockfile matches requirements.txt"
 
       - name: Confirm uvloop is importable
         # If this fails, the platform-conditional branch under test is not

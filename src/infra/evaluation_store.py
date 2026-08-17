@@ -35,7 +35,7 @@ from loguru import logger
 __all__ = ["SCHEMA_VERSION", "EvaluationRecord", "EvaluationStore"]
 
 # Bump when the column set changes so old rows stay interpretable.
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 # Columns holding exact decimal quantities. Stored as TEXT, never REAL.
 _DECIMAL_COLUMNS = (
@@ -51,6 +51,7 @@ _DECIMAL_COLUMNS = (
     "rotation_cost_quote",
     "net_quote",
     "net_bps",
+    "placebo_net_bps",
     "min_net_bps",
     "taker_fee_bps",
 )
@@ -88,6 +89,10 @@ class EvaluationRecord:
     rotation_cost_quote: Optional[Decimal] = None
     net_quote: Optional[Decimal] = None
     net_bps: Optional[Decimal] = None
+    # Net edge the same book would have shown against a DEX quote from
+    # `placebo.delay_cycles` ago. Under the null that the edge is a
+    # staleness artefact, this matches net_bps.
+    placebo_net_bps: Optional[Decimal] = None
     cex_legs: Optional[int] = None
     book_age_s: Optional[float] = None
     depth_levels_used: Optional[int] = None

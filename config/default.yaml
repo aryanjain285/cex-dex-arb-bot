@@ -117,6 +117,15 @@ strategy:
     float_quote: 5000.0           # working capital per venue
     transfer_risk_bps: 10.0       # unhedged exposure while inventory moves
 
+  # Control arm. Alongside each evaluation, the same CEX book is priced against
+  # a DEX quote from `delay_cycles` cycles ago. Under the null hypothesis that
+  # the measured edge is a data-staleness artefact, the placebo distribution
+  # matches the live one -- so if they do NOT diverge, there is no edge, and you
+  # learn that in week one rather than week four. Costs no extra RPC calls.
+  placebo:
+    enabled: true
+    delay_cycles: 5             # ~1s at a 0.2s loop interval
+
 # CEX settings (testnet)
 # cex:
 #   name: "binance-testnet"

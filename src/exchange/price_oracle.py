@@ -11,11 +11,18 @@ decision -- with no error raised and nothing in the logs.
 
 Three time windows govern behaviour:
 
-- within `ttl_seconds` of the last successful fetch, the cached price is served
-  without a network call;
-- after the TTL, a refresh is attempted;
-- if that refresh fails, the previous price is served only while it is within
-  `stale_grace_seconds`, and refused after that.
+- while the last successful fetch is *strictly* younger than `ttl_seconds`, the
+  cached price is served without a network call;
+- at or beyond the TTL, a refresh is attempted;
+- if that refresh fails, the previous price is served only while it is strictly
+  inside `stale_grace_seconds`, and refused at or beyond it.
+
+Both boundaries are exclusive on purpose. With inclusive comparisons a TTL of
+zero still served from cache, and a grace window of zero still served a stale
+price, whenever two calls happened to land in the same clock tick -- so the two
+settings that mean "never cache" and "never serve stale" did neither reliably.
+That failure was invisible on a slow clock and appeared on a fast one, which is
+the worst way for a staleness contract to break.
 """
 from __future__ import annotations
 
@@ -79,6 +86,7 @@ class NativePriceOracle:
         ttl_seconds: float,
         fetcher: Fetcher = coingecko_fetcher,
         stale_grace_seconds: float = 0.0,
+        now_fn: Callable[[], float] = clock.now,
     ):
         if ttl_seconds < 0:
             raise ValueError("ttl_seconds must be non-negative")
@@ -87,14 +95,18 @@ class NativePriceOracle:
         self.ttl_seconds = ttl_seconds
         self.stale_grace_seconds = stale_grace_seconds
         self._fetcher = fetcher
+        # Injectable so the window boundaries can be tested exactly rather than
+        # inferred from however fast the wall clock happens to tick. Defaults to
+        # the single process clock; nothing in production passes anything else.
+        self._now = now_fn
         self._cache: Dict[str, _Entry] = {}
 
     async def get_usd_price(self, chain: str) -> Optional[Decimal]:
         """Return the native-token USD price, or None if it cannot be trusted."""
-        now = clock.now()
+        now = self._now()
         cached = self._cache.get(chain)
 
-        if cached is not None and now - cached.fetched_at <= self.ttl_seconds:
+        if cached is not None and now - cached.fetched_at < self.ttl_seconds:
             return cached.price
 
         try:
@@ -110,7 +122,7 @@ class NativePriceOracle:
         # Refresh failed. Serve the previous value only inside the grace window.
         if cached is not None:
             age = now - cached.fetched_at
-            if age <= self.stale_grace_seconds:
+            if age < self.stale_grace_seconds:
                 logger.warning(
                     f"Serving a stale native price for {chain} "
                     f"({age:.1f}s old, grace {self.stale_grace_seconds}s)."

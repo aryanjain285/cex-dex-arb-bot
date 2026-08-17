@@ -4,7 +4,14 @@ ccxt==4.3.45
 pydantic==2.7.1
 python-dotenv==1.0.1
 pyyaml==6.0.1
-uvloop==0.19.0
+# uvloop is a Linux/macOS-only C extension: its setup.py raises outright on
+# Windows, which fails the whole `pip install -r requirements.txt` and takes
+# every other dependency down with it. The marker keeps the documented install
+# command working on the development platform while the deployment target
+# (Linux) still gets the faster event loop. src/cli/main.py already treats the
+# import as optional, and CI asserts the import succeeds on Linux so this
+# marker cannot quietly disable it where it matters.
+uvloop==0.19.0; sys_platform != "win32"
 orjson==3.10.3
 loguru==0.7.2
 
@@ -17,7 +24,14 @@ keyring==25.2.1
 redis==5.0.4
 
 # CLI & Testing
-typer==0.12.3
+#
+# typer 0.12.3 is incompatible with click >= 8.2: registering an option declared
+# as `--flag/--no-flag` raises "Secondary flag is not valid for non-boolean
+# flag" at import time, so EVERY cli invocation died, `--help` included. click
+# was never pinned here, so the same requirements.txt produced a working
+# environment in April and a completely dead cli later. requirements.lock now
+# pins the whole transitive graph; this pin is the direct-dependency half.
+typer==0.19.2
 pytest==8.2.0
 pytest-asyncio>=0.24
 pandas==2.2.2
