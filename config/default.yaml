@@ -51,6 +51,13 @@ cex:
   api_secret_env: "BINANCE_API_SECRET"
   recv_window_ms: 5000
 
+  # Order book feed. A partial-depth stream pushes a complete top-N
+  # snapshot every book_update_ms, so there is no REST snapshot, no
+  # sequence tracking and no resync path -- and zero REST weight.
+  # 20 levels covers ~$111k of ETHUSDT bid-side notional (measured).
+  book_depth_levels: 20
+  book_update_ms: 100
+
 # Strategy settings.
 # Every value that affects a trading decision lives here, not as a literal in
 # the code. See src/core/config.py:StrategyConfig for validation rules.
@@ -86,9 +93,11 @@ strategy:
   # TTL for the cached intermediate-asset CEX price used by synthetic pairs.
   intermediate_price_cache_seconds: 2.0
 
-  # Reject an order book older than this, in seconds. Without it, a stalled
-  # feed is indistinguishable from a quiet market.
-  max_book_age_seconds: 5.0
+  # Reject an order book older than this, in seconds. On a 100ms stream a
+  # 0.5s gap is unambiguously a stall, so this is a real guard. At the old
+  # 5.0s it permitted five consecutive missed updates on a 1Hz stream and
+  # could not fire before the damage was done.
+  max_book_age_seconds: 0.5
 
 # CEX settings (testnet)
 # cex:
@@ -99,13 +108,30 @@ strategy:
 #   api_secret_env: "BINANCE_API_SECRET"
 #   recv_window_ms: 5000
 
+  # Order book feed. A partial-depth stream pushes a complete top-N
+  # snapshot every book_update_ms, so there is no REST snapshot, no
+  # sequence tracking and no resync path -- and zero REST weight.
+  # 20 levels covers ~$111k of ETHUSDT bid-side notional (measured).
+  book_depth_levels: 20
+  book_update_ms: 100
+
 # Risk and position management
 risk:
-  max_notional_per_leg_quote: 10000  # per-leg notional cap, in the quote currency
+  # Per-leg notional cap. MUST be close to strategy.target_notional_usd or
+  # the gate cannot fire: trade size always derives from target_notional_usd,
+  # so a cap 10x above it is unreachable by construction. 1.2x leaves room
+  # for the VWAP overshoot on the CEX buy leg and nothing more.
+  max_notional_per_leg_quote: 1200
   max_position_per_asset: 2.0        # max inventory of a single asset (e.g. ETH)
   circuit_breaker_bps: 250           # trip the breaker when realised price deviates 2.5% from expected
   cancel_all_on_start: true          # cancel all resting orders on startup
   cancel_all_on_shutdown: true       # cancel all resting orders on shutdown
+
+  # Maximum cumulative realised loss per UTC day, in the quote currency.
+  # Breaching it halts trading and PERSISTS the halt, so a restart cannot
+  # clear it -- an operator must delete or edit data/risk_state.json.
+  # Set to null to disable (paper mode only).
+  max_daily_loss_quote: 250
 
 # Inventory rebalancing
 inventory:

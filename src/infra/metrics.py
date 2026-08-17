@@ -18,9 +18,14 @@ trades_executed = Counter(
 )
 
 # profit and loss
-pnl_quote = Counter(
+# A Gauge, deliberately not a Counter. Counter.inc() raises ValueError on a
+# negative argument, and that raise happened inside executor.run() BEFORE it
+# returned -- so a losing trade propagated an exception past the risk manager's
+# state update and the loss was discarded from PnL accounting entirely, while
+# gains persisted. A PnL series must be able to fall.
+pnl_quote = Gauge(
     "arb_pnl_quote_total",
-    "Cumulative PnL in the quote currency",
+    "Cumulative PnL in the quote currency (can decrease)",
     ["pair"]
 )
 

@@ -195,12 +195,19 @@ class TransactionExecutor:
             completed_ts=clock.now(),
         )
 
-        metrics.trades_executed.labels(
-            pair=opp.pair.cex_symbol,
-            direction=opp.direction,
-            status="success",
-        ).inc()
-        metrics.pnl_quote.labels(pair=opp.pair.cex_symbol).inc(float(pnl_quote))
+        # Metrics are emitted last and defensively: telemetry must never be
+        # able to destroy a trade record. A Counter.inc() with a negative PnL
+        # previously raised here, discarding the loss before the risk manager
+        # could see it.
+        try:
+            metrics.trades_executed.labels(
+                pair=opp.pair.cex_symbol,
+                direction=opp.direction,
+                status="success",
+            ).inc()
+            metrics.pnl_quote.labels(pair=opp.pair.cex_symbol).inc(float(pnl_quote))
+        except Exception as exc:  # pragma: no cover - telemetry must not be fatal
+            logger.error(f"Failed to emit execution metrics: {exc}")
         return summary
 
     def _build_invalid_summary(self, opp: Opportunity, start_ts: float) -> ExecutionSummary:

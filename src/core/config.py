@@ -96,12 +96,59 @@ class CexConfig(BaseModel):
     api_secret_env: str
     recv_window_ms: int
 
+    # Order book source: a *partial book depth* stream, which pushes a
+    # complete top-N snapshot on every frame. Measured live, the alternative
+    # diff stream (@depth) delivers only one update per SECOND, so a detector
+    # polling at 200ms evaluated a book averaging 500ms old -- the same
+    # magnitude as the entire edge threshold, and biased in the direction that
+    # manufactures false signals.
+    #
+    # Binance accepts only these values; anything else silently never
+    # delivers, so they are validated rather than trusted.
+    book_depth_levels: int = 20
+    book_update_ms: int = 100
+
+    @model_validator(mode='after')
+    def validate_cex(self) -> 'CexConfig':
+        if self.book_depth_levels not in (5, 10, 20):
+            raise ValueError(
+                f"book_depth_levels must be 5, 10 or 20 (Binance partial book "
+                f"depth streams), got {self.book_depth_levels}"
+            )
+        if self.book_update_ms not in (100, 1000):
+            raise ValueError(
+                f"book_update_ms must be 100 or 1000, got {self.book_update_ms}"
+            )
+        if self.recv_window_ms <= 0 or self.recv_window_ms > 60000:
+            raise ValueError("recv_window_ms must be in (0, 60000]")
+        return self
+
 class RiskConfig(BaseModel):
     max_notional_per_leg_quote: float
     max_position_per_asset: float
     circuit_breaker_bps: int
     cancel_all_on_start: bool
     cancel_all_on_shutdown: bool
+
+    # Maximum cumulative realised loss for a UTC day, in the quote currency.
+    # Breaching it halts trading and persists the halt, so a restart cannot
+    # clear it. None disables the limit -- only appropriate for paper mode.
+    max_daily_loss_quote: Optional[float] = None
+
+    @model_validator(mode='after')
+    def validate_risk(self) -> 'RiskConfig':
+        if self.max_notional_per_leg_quote <= 0:
+            raise ValueError("max_notional_per_leg_quote must be positive")
+        if self.max_position_per_asset <= 0:
+            raise ValueError("max_position_per_asset must be positive")
+        if self.circuit_breaker_bps <= 0:
+            raise ValueError("circuit_breaker_bps must be positive")
+        if self.max_daily_loss_quote is not None and self.max_daily_loss_quote <= 0:
+            raise ValueError(
+                "max_daily_loss_quote must be a positive magnitude "
+                "(it is applied as a negative bound)"
+            )
+        return self
 
 class RebalanceConfig(BaseModel):
     enable: bool
@@ -254,7 +301,7 @@ class StrategyConfig(BaseModel):
 
     # Reject an order book older than this, in seconds. A stalled feed would
     # otherwise be indistinguishable from a quiet market.
-    max_book_age_seconds: float = 5.0
+    max_book_age_seconds: float = 0.5
 
     @model_validator(mode='after')
     def validate_strategy(self) -> 'StrategyConfig':

@@ -99,11 +99,18 @@ class OpportunityDetector:
             logger.debug(f"Order book for {pair.cex_symbol} is one-sided; skipping.")
             return None
 
-        age = book.age_seconds(clock.now())
-        if age > self.strategy_config.max_book_age_seconds:
+        # Reject on FEED age, not per-symbol age. Binance suppresses
+        # unchanged books, so a quiet illiquid pair legitimately goes seconds
+        # between frames while its quoted price stays correct -- and illiquid
+        # pairs are precisely this strategy's universe. A dead connection, by
+        # contrast, invalidates every book at once.
+        now = clock.now()
+        feed_age = book.feed_age_seconds(now)
+        if feed_age > self.strategy_config.max_book_age_seconds:
             logger.warning(
-                f"Order book for {pair.cex_symbol} is stale ({age:.2f}s old, "
-                f"limit {self.strategy_config.max_book_age_seconds}s); skipping."
+                f"Market data feed is stale ({feed_age:.2f}s since the last frame, "
+                f"limit {self.strategy_config.max_book_age_seconds}s); "
+                f"skipping {pair.cex_symbol}."
             )
             return None
         return book

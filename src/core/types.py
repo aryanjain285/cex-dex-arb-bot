@@ -66,7 +66,14 @@ class BookSnapshot:
     pair: "MarketPair"
     bids: List[tuple]
     asks: List[tuple]
+    # When THIS symbol's book last changed. Grows in a quiet market, which is
+    # a legitimate state -- an unchanged price is current, not stale.
     timestamp: float
+    # When the FEED last delivered any frame, for any symbol. This is the
+    # staleness signal: Binance suppresses unchanged books, so per-symbol age
+    # measures market quiet while connection age measures a dead feed.
+    # Defaults to `timestamp` for callers that supply only one clock.
+    feed_timestamp: Optional[float] = None
 
     @property
     def best_bid(self) -> Optional[Decimal]:
@@ -77,7 +84,19 @@ class BookSnapshot:
         return self.asks[0][0] if self.asks else None
 
     def age_seconds(self, now: float) -> float:
+        """Seconds since this symbol's book last changed."""
         return now - self.timestamp
+
+    def feed_age_seconds(self, now: float) -> float:
+        """Seconds since the feed last delivered anything.
+
+        This is what a staleness guard must use. Measured on Binance:
+        ethusdt produced 150 frames in 15s while dogeusdt produced 30, with
+        gaps up to 2.6s -- every frame carrying a distinct lastUpdateId, so
+        the sparse ones were genuinely unchanged books rather than lost data.
+        """
+        stamp = self.timestamp if self.feed_timestamp is None else self.feed_timestamp
+        return now - stamp
 
 
 class Quote(BaseModel):

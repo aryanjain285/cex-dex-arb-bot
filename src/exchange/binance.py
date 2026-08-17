@@ -1,5 +1,6 @@
 import asyncio
 import orjson
+import random
 import time
 import hmac
 import hashlib
@@ -45,6 +46,14 @@ class BinanceCexClient(CexClient):
         # Unix epoch seconds when each book last received a snapshot or diff.
         # Lets a stalled stream be detected instead of read as a quiet market.
         self._book_synced_at: Dict[str, float] = {}
+        # Reconnect backoff bounds, in seconds. A fixed retry interval
+        # turns a transient outage into a rate-limit ban.
+        # When the feed last delivered ANY frame. Distinct from per-symbol
+        # freshness: Binance suppresses unchanged books, so a quiet symbol
+        # is not a stale feed.
+        self._last_frame_at: float = 0.0
+        self._reconnect_backoff_initial = 1.0
+        self._reconnect_backoff_max = 60.0
         self._listen_key: Optional[str] = None
         self._closing = False
         self._order_pair_cache: Dict[str, MarketPair] = {}
@@ -233,112 +242,136 @@ class BinanceCexClient(CexClient):
         except Exception as exc:  # pragma: no cover
             logger.error(f"Failed to publish fill information to the dashboard: {exc}")
 
-    def _combined_stream_url(self, streams: List[str]) -> str:
-        """
-        Build a Binance *combined* stream URL.
+    def _stream_url(self) -> str:
+        """Build a combined *partial book depth* stream URL.
 
-        The two endpoints behave differently and are not interchangeable:
-          - `/ws/<name>`            -> a single raw stream, payloads unwrapped
-          - `/stream?streams=a/b/c` -> many streams, each payload wrapped as
-                                       {"stream": ..., "data": {...}}
+        Two Binance subtleties are load-bearing here:
 
-        Requesting several streams from `/ws/` yields raw, unwrapped frames, so
-        any consumer that filters on the "stream" key silently discards every
-        update and the local order book is never advanced past its snapshot.
+        - `/ws/<name>` returns raw, unwrapped frames while `/stream?streams=`
+          wraps each payload as {"stream": ..., "data": {...}}. Requesting
+          several streams from `/ws/` yields unwrapped frames, so a consumer
+          filtering on the "stream" key silently discards every update -- which
+          is exactly how the book previously froze after its first snapshot.
+
+        - `@depth` is a 1000ms *diff* stream; `@depth<N>@100ms` is a 100ms
+          *snapshot* stream. Measured, the difference is 1 update/second
+          versus 10, against a detector that polls five times a second.
         """
         base = self.ws_url
         if base.endswith("/ws"):
             base = base[: -len("/ws")]
+        levels = self.config.book_depth_levels
+        interval = self.config.book_update_ms
+        streams = [
+            f"{p.cex_symbol.replace('/', '').lower()}@depth{levels}@{interval}ms"
+            for p in self.pairs
+        ]
         return f"{base}/stream?streams={'/'.join(streams)}"
 
     async def _ws_listener(self):
-        streams = [f"{p.cex_symbol.replace('/', '').lower()}@depth" for p in self.pairs]
-        url = self._combined_stream_url(streams)
+        """Maintain local books from partial-depth snapshots.
 
-        while True:
+        There is deliberately no REST snapshot and no resync path. Every frame
+        is self-contained, so a missed or malformed frame costs 100ms of
+        freshness and nothing else -- it cannot desynchronise a book. That
+        removes the failure mode where a swallowed snapshot error left the
+        book permanently stale while a per-event resync loop burned ~3000
+        weight/minute per stuck symbol until the exchange banned the IP.
+        """
+        backoff = self._reconnect_backoff_initial
+        while not self._closing:
+            url = self._stream_url()
             try:
-                async with websockets.connect(url) as ws:
+                async with websockets.connect(url, ping_interval=20) as ws:
                     self._ws_conn = ws
                     logger.info(f"Connected to the Binance WebSocket: {url}")
-                    # after connecting, sync the order book for every pair
-                    await self._sync_all_orderbooks()
-
+                    backoff = self._reconnect_backoff_initial
                     async for message in ws:
                         data = orjson.loads(message)
-                        # combined streams wrap the payload; tolerate raw frames too
+                        # Combined streams wrap the payload; tolerate raw frames.
                         payload = data.get("data") if "stream" in data else data
                         if payload:
-                            await self._handle_ws_message(payload)
-            except websockets.exceptions.ConnectionClosed as e:
-                logger.warning(f"Binance WebSocket connection closed: {e}. Reconnecting in 5s...")
+                            await self._handle_ws_message(
+                                payload, stream=data.get("stream")
+                            )
+            except asyncio.CancelledError:  # pragma: no cover
+                break
             except Exception as e:
-                logger.error(f"WebSocket listener error: {e}. Reconnecting in 5s...", exc_info=True)
-            
-            await asyncio.sleep(5)
+                if self._closing:
+                    break
+                logger.warning(
+                    f"Binance WebSocket error: {e}. Reconnecting in {backoff:.1f}s."
+                )
 
-    async def _sync_all_orderbooks(self):
-        for pair in self.pairs:
-            await self._sync_orderbook(pair)
+            if self._closing:
+                break
+            # Exponential backoff with jitter. A fixed short retry produced a
+            # reconnect storm: N pairs x a snapshot each, repeated every few
+            # seconds, is a straight path to a rate-limit ban.
+            await asyncio.sleep(backoff * (1.0 + 0.25 * random.random()))
+            backoff = min(backoff * 2, self._reconnect_backoff_max)
 
-    async def _sync_orderbook(self, pair: MarketPair):
-        symbol = pair.cex_symbol.replace('/', '')
-        logger.debug(f"Syncing the order book snapshot for {symbol}...")
-        if not self._session:
-            raise ConnectionError("Session not initialized.")
+    async def _handle_ws_message(
+        self, data: dict, stream: Optional[str] = None
+    ) -> None:
+        """Apply one partial-depth snapshot, replacing the book wholesale.
 
-        params = {'symbol': symbol, 'limit': 1000}
+        A partial-depth stream never sends deletions, so merging into the
+        existing book would leave orphaned levels below the top N indefinitely.
+        Replacement is the only correct semantics.
+
+        Partial-depth payloads carry NO symbol field, so `stream` -- the key
+        from the combined-stream wrapper -- is the only routing information
+        available. Without it, nothing beyond a single-pair setup could ever
+        be updated.
+        """
+        symbol = self._resolve_symbol(data, stream)
+        if symbol is None:
+            return
+        if symbol not in self.orderbooks:
+            logger.debug(f"Ignoring frame for unsubscribed symbol {symbol}.")
+            return
+        if "bids" not in data or "asks" not in data:
+            logger.debug(f"Ignoring non-depth frame for {symbol}.")
+            return
+
         try:
-            async with self._session.get(f"{self.base_url}/api/v3/depth", params=params) as response:
-                response.raise_for_status()
-                data = await response.json(loads=orjson.loads)
-                
-                self.last_update_ids[symbol] = data['lastUpdateId']
-                self.orderbooks[symbol]['bids'] = {Decimal(price): Decimal(qty) for price, qty in data['bids']}
-                self.orderbooks[symbol]['asks'] = {Decimal(price): Decimal(qty) for price, qty in data['asks']}
-                self._book_synced_at[symbol] = clock.now()
-                logger.info(f"{symbol} order book synced. LastUpdateId: {data['lastUpdateId']}")
-        except aiohttp.ClientError as e:
-            logger.error(f"Failed to fetch {symbol} order book snapshot failed: {e}")
-
-    async def _handle_ws_message(self, data: dict):
-        if data.get('e') != 'depthUpdate':
+            bids = {Decimal(price): Decimal(qty) for price, qty in data["bids"]}
+            asks = {Decimal(price): Decimal(qty) for price, qty in data["asks"]}
+        except (TypeError, ValueError, ArithmeticError) as exc:
+            logger.warning(f"Malformed depth frame for {symbol}: {exc}")
             return
 
-        symbol = data['s']
-        first_update_id = data['U']
-        final_update_id = data['u']
-
-        if symbol not in self.last_update_ids:
-            logger.warning(f"Received {symbol}  WebSocket update received, but the order book is not yet synced.")
+        # An empty frame must not blank a usable book and stamp it fresh.
+        if not bids or not asks:
+            logger.debug(f"Ignoring empty depth frame for {symbol}.")
             return
 
-        # per the Binance docs, resync when first_update_id > last_update_id + 1
-        if first_update_id > self.last_update_ids[symbol] + 1:
-            logger.warning(f"{symbol} WebSocket update gap detected; resyncing...")
-            await self._sync_orderbook(next(p for p in self.pairs if p.cex_symbol.replace('/','') == symbol))
-            return
+        book = self.orderbooks[symbol]
+        book["bids"] = bids
+        book["asks"] = asks
+        now = clock.now()
+        self.last_update_ids[symbol] = int(data.get("lastUpdateId", 0))
+        self._book_synced_at[symbol] = now
+        self._last_frame_at = now
 
-        # only apply the update when final_update_id > last_update_id
-        if final_update_id <= self.last_update_ids[symbol]:
-            return
+    def _resolve_symbol(self, data: dict, stream: Optional[str]) -> Optional[str]:
+        """Determine which book a frame belongs to.
 
-        # apply the update to the order book
-        for price, qty in data['b']: # Bids
-            p, q = Decimal(price), Decimal(qty)
-            if q == 0:
-                self.orderbooks[symbol]['bids'].pop(p, None)
-            else:
-                self.orderbooks[symbol]['bids'][p] = q
-        
-        for price, qty in data['a']: # Asks
-            p, q = Decimal(price), Decimal(qty)
-            if q == 0:
-                self.orderbooks[symbol]['asks'].pop(p, None)
-            else:
-                self.orderbooks[symbol]['asks'][p] = q
-        
-        self.last_update_ids[symbol] = final_update_id
-        self._book_synced_at[symbol] = clock.now()
+        Preference order: an explicit symbol field (diff streams carry `s`),
+        then the combined-stream name, then -- only when exactly one pair is
+        configured -- that pair. The single-pair fallback exists so a
+        minimal setup works without the wrapper; it must never be relied on
+        for multi-pair routing, which is why an unsubscribed symbol is
+        rejected by the caller rather than silently written somewhere.
+        """
+        if data.get("s"):
+            return str(data["s"]).upper()
+        if stream:
+            return stream.split("@", 1)[0].upper()
+        if len(self.pairs) == 1:
+            return self.pairs[0].cex_symbol.replace('/', '')
+        return None
 
     async def get_book(self, pair: MarketPair) -> Optional[BookSnapshot]:
         """Return the locally maintained depth ladder for this pair.
@@ -364,7 +397,10 @@ class BinanceCexClient(CexClient):
         # Sorted best-first: asks ascending, bids descending.
         asks = sorted(book['asks'].items())
         bids = sorted(book['bids'].items(), reverse=True)
-        return BookSnapshot(pair=pair, bids=bids, asks=asks, timestamp=synced_at)
+        return BookSnapshot(
+            pair=pair, bids=bids, asks=asks, timestamp=synced_at,
+            feed_timestamp=self._last_frame_at,
+        )
 
     async def get_quote(self, pair: MarketPair) -> Optional[Quote]:
         symbol = pair.cex_symbol.replace('/', '')
