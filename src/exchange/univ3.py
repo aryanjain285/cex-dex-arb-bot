@@ -269,6 +269,40 @@ class UniV3DexClient(DexClient):
             return Web3.to_checksum_address(pool_address)
         return None
 
+    async def quote_exact_input_single_raw(
+        self, *, chain: str, token_in: str, token_out: str, fee: int,
+        amount_in: int, block_number: Optional[int] = None,
+    ) -> int:
+        """QuoterV2's raw integer output, at a specific block.
+
+        Kept as an ORACLE, not as the hot path. The local simulator in
+        `univ3_math` is what prices a trade; this is what the simulator is checked
+        against, and pinning the block is what makes that comparison meaningful --
+        otherwise the two answers can differ simply because the pool moved between
+        them, and a real disagreement would be indistinguishable from a race.
+        """
+        w3 = self._get_w3(chain)
+        quoter_address = Web3.to_checksum_address(
+            self.dex_config.uniswap_v3[chain].quoter_v2
+        )
+        quoter = w3.eth.contract(address=quoter_address, abi=self.quoter_abi)
+        params = (
+            Web3.to_checksum_address(token_in),
+            Web3.to_checksum_address(token_out),
+            int(amount_in),
+            int(fee),
+            0,
+        )
+
+        def _call():
+            call = quoter.functions.quoteExactInputSingle(params)
+            if block_number is None:
+                return call.call()
+            return call.call(block_identifier=block_number)
+
+        raw = await self._rpc(chain, _call)
+        return int(raw[0]) if isinstance(raw, (list, tuple)) else int(raw)
+
     async def get_balance(self, asset: str, chain: str) -> Decimal:
         """Return the wallet balance of a token on a specific chain."""
         w3 = self._get_w3(chain)
