@@ -33,6 +33,7 @@ from typing import List, Optional, Sequence, Tuple
 
 from loguru import logger
 
+from ._tick_reader import read_bitmaps, read_liquidity_nets
 from .univ3_math import MAX_TICK, MIN_TICK, TickInfo, V3Pool
 
 __all__ = [
@@ -383,13 +384,13 @@ async def fetch_pool_state(
     highest = min(MAX_TICK // tick_spacing, compressed + tick_range)
     words = range(lowest >> 8, (highest >> 8) + 1)
 
-    bitmaps = await asyncio.gather(*(
-        client._rpc(chain, _call(pool.functions.tickBitmap(word)))
-        for word in words
-    ))
+    # Batched through Multicall3 where it is deployed, one call per word where it is
+    # not. A full read is otherwise ~200 round trips, measured at 60-160s against
+    # public endpoints, which makes recording more than a handful of pools impossible.
+    bitmaps = await read_bitmaps(client, chain, pool, w3, words, block_number)
 
     candidate_ticks: List[int] = []
-    for word_position, word in zip(words, bitmaps):
+    for word_position, word in bitmaps.items():
         candidate_ticks.extend(
             _initialised_ticks_from_bitmap(word_position, int(word), tick_spacing)
         )
@@ -411,14 +412,11 @@ async def fetch_pool_state(
         max_ticks=max_ticks,
     )
 
-    liquidity_nets = await asyncio.gather(*(
-        client._rpc(chain, _call(pool.functions.ticks(tick)))
-        for tick in candidate_ticks
-    ))
     ticks = [
-        TickInfo(tick=tick, liquidity_net=int(data[1]))
-        for tick, data in zip(candidate_ticks, liquidity_nets)
-        if int(data[1]) != 0
+        TickInfo(tick=tick, liquidity_net=net)
+        for tick, net in await read_liquidity_nets(
+            client, chain, pool, w3, candidate_ticks, block_number
+        )
     ]
 
     from ..core import clock

@@ -16,7 +16,9 @@ from ..core.config import DexConfig, NetworkConfig, SecretsConfig, TokenDetails
 from .price_oracle import NativePriceOracle
 from ..core.types import MarketPair, DexQuote, DexSwapParams, DexTxReceipt
 from .dex_base import DexClient
-from .errors import ReadOnlyWalletError, RpcError, classify_rpc_failure
+from .errors import (
+    ReadOnlyWalletError, RpcError, classify_rpc_failure, is_rate_limited,
+)
 from .rpc_limit import RpcLimiter
 
 TEN_THOUSAND = Decimal("10000")
@@ -189,7 +191,16 @@ class UniV3DexClient(DexClient):
         would let one pending transaction starve every quote.
         """
         async with self._rpc_limiter.acquire(chain):
-            return await asyncio.to_thread(fn, *args, **kwargs)
+            try:
+                return await asyncio.to_thread(fn, *args, **kwargs)
+            except Exception as exc:
+                # A 429 is information, not just a failure. Without feeding it back
+                # the next request goes out at exactly the rate the endpoint just
+                # refused, and a throttled endpoint degrades into a mostly-failing
+                # one -- which in a recording run looks like a market with no data.
+                if is_rate_limited(exc):
+                    self._rpc_limiter.throttled(chain)
+                raise
 
     @staticmethod
     async def _rpc_unpaced(fn, *args, **kwargs):

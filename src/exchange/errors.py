@@ -82,6 +82,36 @@ def classify_rpc_failure(exc: BaseException) -> bool:
     return any(marker in text for marker in _TRANSPORT_MARKERS)
 
 
+# Markers that mean specifically "you are going too fast", as distinct from the
+# general transport failures above. Separated because the correct response differs:
+# a timeout is retried at the same rate, a refusal must LOWER the rate.
+_RATE_LIMIT_MARKERS = (
+    "429",
+    "too many requests",
+    "rate limit",
+    "rate-limited",
+    "exceeded",
+    "throttl",
+    # Some providers signal an IP ban rather than a soft limit. Same response,
+    # more urgently.
+    "418",
+)
+
+
+def is_rate_limited(exc: BaseException) -> bool:
+    """True when the node refused because the caller is too fast.
+
+    Distinct from `classify_rpc_failure`, which only asks whether the node answered.
+    Both are true for a 429, but only this one should change the pacing: treating
+    every timeout as a rate limit would ratchet the rate down to the floor on a slow
+    endpoint that was never complaining about volume.
+    """
+    text = f"{type(exc).__name__}: {exc}".lower()
+    if "revert" in text:
+        return False
+    return any(marker in text for marker in _RATE_LIMIT_MARKERS)
+
+
 class ReadOnlyWalletError(RuntimeError):
     """Raised when a read-only client is asked to sign.
 
