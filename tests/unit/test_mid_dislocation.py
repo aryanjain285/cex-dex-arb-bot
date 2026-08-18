@@ -88,3 +88,48 @@ def test_a_one_sided_book_has_no_mid():
         pool=_pool("100"),
     )
     assert mid_dislocation_bps(observation, base_is_token0=True) is None
+
+
+class TestAPoolWithNoLiquidityHasNoPrice:
+    """An empty pool still reports a sqrtPriceX96, and it is meaningless.
+
+    Uniswap v3 sets a pool's price when it is initialised and leaves it there until
+    someone trades. A pool created and never used therefore has whatever price its
+    creator chose, forever, with nothing behind it. The factory happily returns its
+    address, so pool existence is not evidence of a market.
+
+    Measured on the wide screen, which found 568 pools for 175 Binance-listed assets:
+
+      AUCTION/USDC ethereum 3000    36,586,588 bps
+      CHR/USDT     arbitrum 3000   728,469,999 bps
+      COMP/USDC    arbitrum  500       5.7e26 bps
+      AAVE/USDC    base      500       3.9e52 bps
+
+    and dozens at exactly -10,000 bps, which is -100%: a price of zero.
+
+    Read as dislocations these are the largest opportunities in the dataset by many
+    orders of magnitude, and every one of them is an empty pool. Any ranking by edge
+    would surface them first. So a pool with no active liquidity yields no
+    dislocation -- not a large one.
+    """
+
+    def test_an_empty_pool_has_no_dislocation(self):
+        from dataclasses import replace
+
+        observation = _obs("1900", "1900")
+        empty = replace(observation, pool=replace(observation.pool, liquidity=0))
+        assert mid_dislocation_bps(empty, base_is_token0=True) is None
+
+    def test_a_pool_with_liquidity_still_reports(self):
+        observation = _obs("1900", "1909.5")
+        assert mid_dislocation_bps(observation, base_is_token0=True) is not None
+
+    def test_the_absurd_screen_readings_are_refused(self):
+        """A price of zero, and a price 10^26 times the exchange, both from pools with
+        no liquidity. Either would dominate any ranking by edge."""
+        from dataclasses import replace
+
+        for pool_price in ("0.0000000000001", "1e20"):
+            observation = _obs("1900", pool_price)
+            empty = replace(observation, pool=replace(observation.pool, liquidity=0))
+            assert mid_dislocation_bps(empty, base_is_token0=True) is None

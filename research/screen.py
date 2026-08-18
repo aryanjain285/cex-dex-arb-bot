@@ -45,28 +45,42 @@ from src.research.observations import Observation, ObservationStore
 SLOT0_OUTPUTS = ["uint160", "int24", "uint16", "uint16", "uint16", "uint8", "bool"]
 
 
+def _encode(contract, name):
+    encoder = getattr(contract, "encode_abi", None)
+    if encoder is not None:
+        try:
+            return encoder(abi_element_identifier=name, args=[])
+        except TypeError:
+            return encoder(name, [])
+    return contract.encodeABI(fn_name=name, args=[])
+
+
 async def screen_chain(client, multicall, chain, targets, w3):
-    """{pool_address: (sqrt_price_x96, tick, block)} for every target on one chain."""
+    """{pool_address: (sqrt_price_x96, tick, liquidity, block)} for one chain.
+
+    LIQUIDITY IS READ, not assumed. An empty pool still reports a price -- v3 sets it
+    at initialisation and leaves it there until someone trades -- and the factory
+    returns the address of a pool nobody has ever used. On the first 568-pool screen
+    that produced dislocations of 36 million, 728 million and 3.9e52 bps, plus dozens
+    at exactly -10,000 (a price of zero). Every one was an empty pool, and every one
+    would have ranked above the real markets. So liquidity comes back with the price
+    and the analysis refuses a dislocation without it.
+    """
     if not targets:
         return {}
     block = await client._rpc(chain, lambda: w3.eth.block_number)
     pool_contract = w3.eth.contract(
         address=Web3.to_checksum_address(targets[0]["pool_address"]), abi=POOL_ABI
     )
-    encoder = getattr(pool_contract, "encode_abi", None)
-    if encoder is not None:
-        try:
-            calldata = encoder(abi_element_identifier="slot0", args=[])
-        except TypeError:
-            calldata = encoder("slot0", [])
-    else:
-        calldata = pool_contract.encodeABI(fn_name="slot0", args=[])
+    slot0_data = _encode(pool_contract, "slot0")
+    liquidity_data = _encode(pool_contract, "liquidity")
 
-    calls = [
-        (Web3.to_checksum_address(t["pool_address"]), calldata) for t in targets
-    ]
+    calls = []
+    for t in targets:
+        address = Web3.to_checksum_address(t["pool_address"])
+        calls.append((address, slot0_data))
+        calls.append((address, liquidity_data))
     if not await multicall.available(chain):
-        # No batching: one call per pool, still only one call each.
         out = {}
         for target in targets:
             contract = w3.eth.contract(
@@ -77,25 +91,37 @@ async def screen_chain(client, multicall, chain, targets, w3):
                     chain,
                     lambda c=contract: c.functions.slot0().call(block_identifier=block),
                 )
+                liquidity = await client._rpc(
+                    chain,
+                    lambda c=contract: c.functions.liquidity().call(
+                        block_identifier=block
+                    ),
+                )
             except Exception:
                 continue
-            out[target["pool_address"].lower()] = (int(slot0[0]), int(slot0[1]), block)
+            out[target["pool_address"].lower()] = (
+                int(slot0[0]), int(slot0[1]), int(liquidity), block
+            )
         return out
 
     raw = await multicall.aggregate(chain, calls, block_number=block)
     out = {}
-    for target, data in zip(targets, raw):
-        if data is None:
+    for i, target in enumerate(targets):
+        slot0_raw, liquidity_raw = raw[2 * i], raw[2 * i + 1]
+        if slot0_raw is None or liquidity_raw is None:
             continue
         try:
-            decoded = w3.codec.decode(SLOT0_OUTPUTS, data)
+            decoded = w3.codec.decode(SLOT0_OUTPUTS, slot0_raw)
+            liquidity = int(w3.codec.decode(["uint128"], liquidity_raw)[0])
         except Exception:
             continue
-        out[target["pool_address"].lower()] = (int(decoded[0]), int(decoded[1]), block)
+        out[target["pool_address"].lower()] = (
+            int(decoded[0]), int(decoded[1]), liquidity, block
+        )
     return out
 
 
-def screen_snapshot(target, sqrt_price_x96, tick, block, base_is_token0):
+def screen_snapshot(target, sqrt_price_x96, tick, liquidity, block, base_is_token0):
     """A snapshot carrying spot price only.
 
     Empty ticks and no observed window, on purpose. That makes it unquotable at every
@@ -109,7 +135,9 @@ def screen_snapshot(target, sqrt_price_x96, tick, block, base_is_token0):
     """
     return PoolSnapshot(
         sqrt_price_x96=sqrt_price_x96,
-        liquidity=0,
+        # Real, so the analysis can tell a market from an abandoned pool. Still no
+        # ticks, so it remains unquotable at every size.
+        liquidity=liquidity,
         tick=tick,
         fee=int(target["fee"]),
         tick_spacing=1,
@@ -243,14 +271,14 @@ async def main():
                 )
                 if found is None:
                     continue
-                sqrt_price_x96, tick, block = found
+                sqrt_price_x96, tick, liquidity, block = found
                 pair = pairs.get(target["cex_symbol"])
                 book = await cex.get_book(pair) if pair else None
                 if book is None or not book.bids or not book.asks:
                     continue
                 base_is_token0 = orientation[target["pool_address"].lower()]
                 snapshot = screen_snapshot(
-                    target, sqrt_price_x96, tick, block, base_is_token0
+                    target, sqrt_price_x96, tick, liquidity, block, base_is_token0
                 )
                 store.record(Observation(
                     ts=now, cex_symbol=target["cex_symbol"], base=target["base"],

@@ -421,6 +421,19 @@ def mid_dislocation_bps(
     mid = observation.cex_mid
     if mid is None or mid <= 0:
         return None
+    # An empty pool still reports a price, and it is meaningless. Uniswap v3 sets the
+    # price at initialisation and leaves it there until someone trades, so a pool
+    # created and never used keeps whatever its creator chose, forever, with nothing
+    # behind it -- and the factory returns its address regardless, so existence is not
+    # evidence of a market.
+    #
+    # Measured on the wide screen over 568 pools: AUCTION/USDC showed 36,586,588 bps,
+    # CHR/USDT 728,469,999, AAVE/USDC on Base 3.9e52, and dozens sat at exactly
+    # -10,000 bps, which is a price of zero. Read as dislocations these are the largest
+    # opportunities in the dataset by many orders of magnitude, and every one is an
+    # empty pool. Any ranking by edge surfaces them first.
+    if observation.pool.liquidity <= 0:
+        return None
     spot = observation.pool.spot_price()  # token0 in token1
     if spot is None or spot <= 0:
         return None
