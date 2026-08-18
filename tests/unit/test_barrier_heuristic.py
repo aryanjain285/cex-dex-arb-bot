@@ -23,6 +23,13 @@ So the classifier flags it, and flags in the right direction. Confirming which b
 needs Binance's signed withdrawal-network endpoint, which a read-only research process
 deliberately cannot reach -- so this raises the question rather than answering it, which
 is still the opposite of what "YES, clears the floor" did.
+
+The samples here are deliberately large. Persistence is established by a sign test on the
+EFFECTIVE sample, so a short series cannot support the claim whatever its values -- see
+test_classify_needs_correlation_times. Sample size is not what these tests are about, so
+they supply enough of it to isolate the behaviour they do test, and they vary slightly
+rather than repeating one value -- an exactly constant series never decorrelates, which
+is arithmetically true and describes a stalled feed rather than a market.
 """
 import pytest
 
@@ -32,15 +39,15 @@ from src.research.report import BARRIER_SUSPECTED_BPS, classify_dislocation
 class TestTheMeasuredCase:
     def test_the_bnb_reading_is_flagged_as_a_barrier(self):
         """+455 bps, sign never changes."""
-        result = classify_dislocation([455.0 + (i % 7) * 0.8 for i in range(60)])
+        result = classify_dislocation([455.0 + (i % 7) * 0.8 for i in range(800)])
         assert result["kind"] == "standing_basis"
         assert result["barrier_suspected"] is True
 
     def test_it_would_otherwise_have_been_the_best_market_in_the_dataset(self):
         """The counterfactual that makes this worth encoding: on magnitude alone it beats
         every genuine market by an order of magnitude."""
-        barrier = classify_dislocation([455.0] * 60)
-        genuine = classify_dislocation([26.1] * 60)
+        barrier = classify_dislocation([455.0 + (i % 11) * 0.3 for i in range(800)])
+        genuine = classify_dislocation([26.1 + (i % 9) * 0.2 for i in range(800)])
         assert abs(barrier["median_bps"]) > abs(genuine["median_bps"]) * 10
         assert barrier["barrier_suspected"] is True
 
@@ -50,14 +57,14 @@ class TestItDoesNotFireOnRealMarkets:
         """+2.6 bps on ETH/USDC Arbitrum is a settlement basis and an ordinary one. It is
         unharvestable because it is small and one-sided, which the standing-basis label
         already says -- adding a barrier claim would overstate it."""
-        result = classify_dislocation([2.6 + (i % 5) * 0.1 for i in range(60)])
+        result = classify_dislocation([2.6 + (i % 5) * 0.1 for i in range(800)])
         assert result["kind"] == "standing_basis"
         assert result["barrier_suspected"] is False
 
     def test_the_link_reading_is_not_flagged(self):
         """LINK/WETH at -26 bps standing: below its floor, and well below the barrier
         threshold. A real basis, no barrier claim."""
-        result = classify_dislocation([-26.1 - (i % 4) * 0.5 for i in range(60)])
+        result = classify_dislocation([-26.1 - (i % 4) * 0.5 for i in range(800)])
         assert result["kind"] == "standing_basis"
         assert result["barrier_suspected"] is False
 
@@ -65,7 +72,7 @@ class TestItDoesNotFireOnRealMarkets:
         """The distinction that carries the whole argument. A large gap whose sign
         changes IS being closed, repeatedly -- that is what a fluctuating sign means. It
         is the persistence, not the size, that implies a barrier."""
-        result = classify_dislocation([300.0, -300.0] * 40)
+        result = classify_dislocation([300.0, -300.0] * 400)
         assert result["kind"] == "fluctuating"
         assert result["barrier_suspected"] is False
 
@@ -75,17 +82,17 @@ class TestTheThresholdIsExplicit:
         assert BARRIER_SUSPECTED_BPS >= 50
 
     def test_it_is_reported_so_the_verdict_can_be_checked(self):
-        result = classify_dislocation([455.0] * 60)
+        result = classify_dislocation([455.0 + (i % 11) * 0.3 for i in range(800)])
         assert result["barrier_threshold_bps"] == BARRIER_SUSPECTED_BPS
 
     def test_it_is_configurable(self):
-        values = [150.0] * 60
+        values = [150.0 + (i % 7) * 0.4 for i in range(800)]
         assert classify_dislocation(values, barrier_bps=100.0)["barrier_suspected"] is True
         assert classify_dislocation(values, barrier_bps=200.0)["barrier_suspected"] is False
 
     def test_the_sign_of_the_gap_does_not_matter(self):
         """A persistent discount is as unsettleable as a persistent premium."""
-        assert classify_dislocation([-455.0] * 60)["barrier_suspected"] is True
+        assert classify_dislocation([-455.0 - (i % 11) * 0.3 for i in range(800)])["barrier_suspected"] is True
 
 
 class TestTooLittleData:

@@ -46,6 +46,8 @@ __all__ = [
     "persistence_runs",
     "decay_profile",
     "half_life_seconds",
+    "autocorrelation_converged",
+    "sign_test_p_value",
 ]
 
 Number = Union[float, int, Decimal]
@@ -402,3 +404,82 @@ def half_life_seconds(
             return (previous_lag + fraction) * cadence_seconds
         previous_lag, previous_rho = float(lag), rho
     return None
+
+def autocorrelation_converged(values: Iterable[Number]) -> bool:
+    """Did the autocorrelation actually decay inside this sample?
+
+    The integrated autocorrelation time is estimated by summing rho_k until rho first
+    goes non-positive, capped at n/4 because beyond that each rho_k rests on too few
+    pairs to be worth summing. That cap makes the estimator CENSORED: if the series has
+    not decorrelated by lag n/4, the sum stops early and tau comes back far too small.
+
+    Which defeats any guard built on tau for the case it most needs to catch. Measured on
+    an AR(1) with phi=0.99, whose true tau is about 115:
+
+        n=  30   tau estimated  2.92   ->  10.3 "correlation times"
+        n=  60   tau estimated 17.84   ->   3.4
+        n=4000   tau estimated 115.37  ->  34.7
+
+    At n=30 the estimator reports a MORE independent sample than at n=60, because it
+    cannot see past lag 7. A short, strongly persistent series therefore looks like a
+    long, weakly persistent one, and that is exactly the sample whose persistence must
+    not be trusted.
+
+    So the honest test is whether the sum terminated on its own. If rho is still positive
+    at the largest measurable lag, the correlation time is not merely uncertain -- it is
+    below the resolution of the sample, and so is anything derived from it.
+    """
+    data = _floats(values)
+    n = len(data)
+    if n < 8:
+        return False
+    max_lag = max(1, n // 4)
+    for lag in range(1, max_lag + 1):
+        rho = autocorrelation(data, lag)
+        if rho is None:
+            return False
+        if rho <= 0:
+            # Terminated naturally: the series forgot itself within the sample.
+            return True
+    return False
+
+def sign_test_p_value(values: Iterable[Number]) -> Optional[float]:
+    """Two-sided p-value for "this series is symmetric about zero", on EFFECTIVE draws.
+
+    The point of doing it this way rather than counting sign flips against a threshold:
+    a binary "standing basis" label hides its own sample-size dependence, and this
+    project got that wrong in the obvious direction. ETH/USDC 0.05% Arbitrum classified
+    as a standing basis with 0.0% sign flips on 236 observations; an hour later, with
+    1,713, it flipped sign in 48.7% of them.
+
+    The 236-observation reading was not unreasonable and was not right. Its
+    autocorrelation time was 20, so it held about 11 independent draws, and 11 draws all
+    on one side has probability 2^-10 = 0.001 under a symmetric null -- suggestive, and
+    nowhere near the certainty a bare label conveys. The honest output is the p-value,
+    because it carries the sample size with it.
+
+    Uses the effective sample size, not the row count. Using the row count would make a
+    persistent series look overwhelmingly significant purely for having been sampled
+    often, which is the same inflation `batch_means_interval` exists to prevent.
+    """
+    data = _floats(values)
+    if len(data) < 8:
+        return None
+    effective = effective_sample_size(data)
+    if effective < 2:
+        return None
+
+    positive = sum(1 for v in data if v > 0)
+    negative = sum(1 for v in data if v < 0)
+    total = positive + negative
+    if total == 0:
+        return None
+    # Scale the observed split down to the effective sample, rounding the minority side
+    # UP so the test is conservative: it never claims more asymmetry than it has.
+    minority_fraction = min(positive, negative) / total
+    minority = int(math.ceil(minority_fraction * effective))
+
+    # Two-sided binomial tail at p=0.5.
+    cumulative = sum(math.comb(effective, k) for k in range(0, minority + 1))
+    tail = cumulative / (2 ** effective)
+    return min(1.0, 2.0 * tail)

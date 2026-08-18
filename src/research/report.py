@@ -47,16 +47,20 @@ from .evaluate import (
 )
 from .observations import Observation, ObservationStore, mid_dislocation_bps
 from .statistics import (
+    autocorrelation_converged,
     batch_means_interval,
     describe,
     exceedance,
+    integrated_autocorrelation_time,
     persistence_runs,
+    sign_test_p_value,
 )
 
 __all__ = [
     "MarketReport", "analyse_store", "group_key", "format_report",
     "scrambled_control", "format_summary_table", "classify_dislocation",
-    "BASIS_FLIP_THRESHOLD",
+    "BASIS_FLIP_THRESHOLD", "MIN_CORRELATION_TIMES_TO_CLASSIFY",
+    "BARRIER_SUSPECTED_BPS",
 ]
 
 # Thresholds the exceedance curve is reported at, in bps. Chosen to span the
@@ -475,7 +479,10 @@ def format_report(report: MarketReport) -> str:
             )
         elif kind == "standing_basis":
             lines.append(
-                f"              STANDING BASIS: the sign flips in only "
+                f"              STANDING BASIS (sign test p="
+                f"{report.basis_kind.get('sign_test_p', float('nan')):.4f} on "
+                f"{report.gross_interval.get('effective_n') or 0} effective draws): "
+                f"the sign flips in only "
                 f"{report.basis_kind['sign_flip_fraction']:.1%} of observations. "
                 f"This is a price, not an error -- what the market charges for the "
                 f"asset being on this chain rather than in that custodian. Capturing "
@@ -768,10 +775,39 @@ def format_summary_table(reports: Sequence[MarketReport]) -> str:
 # label is the stronger claim.
 BASIS_FLIP_THRESHOLD = 0.05
 
-# Fewer observations than this and the question is not asked. Three readings sharing a
-# sign are not evidence of a standing basis, and calling them one would be the
-# strongest available conclusion from the weakest available sample.
-MIN_OBSERVATIONS_TO_CLASSIFY = 20
+# Fewer observations than this and the question is not asked.
+#
+# Raised from 20 after measuring what the estimator does below it. The integrated
+# autocorrelation time is summed only to lag n/4, so on a short series it is CENSORED --
+# and censored downward, which inflates the effective sample size and therefore inflates
+# the significance of any persistence claim. On an AR(1) with phi=0.99, true tau about
+# 115:
+#
+#     n= 30   tau estimated  2.92   sign test p=0.002   (spuriously significant)
+#     n= 60   tau estimated 17.84   autocorrelation has not decayed -> refused
+#     n=200   tau estimated 34.19   p=0.063             (correctly not significant)
+#     n=450   tau estimated 61.93   p=0.016
+#
+# At n=30 the sample reports MORE independent draws than at n=60, because it cannot see
+# past lag 7. So the floor has to be high enough that an autocorrelation estimate means
+# something at all, independently of the convergence and correlation-time guards below.
+MIN_OBSERVATIONS_TO_CLASSIFY = 100
+
+# And an observation count alone is not enough, because it says nothing about how many
+# INDEPENDENT draws the sample contains.
+#
+# The classifier called ETH/USDC 0.05% Arbitrum a standing basis at +2.6 bps with 0.0%
+# sign flips on fifteen minutes of data. An hour later the same market was fluctuating at
+# -0.22 bps with 48.7% flips. Both readings were accurate about their own samples, and the
+# first was still wrong: that market's correlation time is about 50 observations at a
+# 2-second cadence, so a 20-observation sample spans under half of one. A series that takes
+# 100 seconds to forget its own value cannot be observed to change sign in 40 -- not
+# because it does not, but because the sample holds barely one independent draw, and "how
+# often does the sign flip" is then unanswerable rather than merely uncertain.
+#
+# So the requirement is stated in correlation times. How many observations that takes is a
+# property of the data, not a constant.
+MIN_CORRELATION_TIMES_TO_CLASSIFY = 5.0
 
 # A standing gap at least this large is treated as evidence of a barrier rather than of
 # an opportunity. 100 bps is chosen to be well beyond anything competitive arbitrage
@@ -802,19 +838,65 @@ def classify_dislocation(
     reliable signal. It is the opposite: a signal that cannot be harvested repeatedly.
     """
     data = [float(v) for v in values if v is not None]
-    if len(data) < MIN_OBSERVATIONS_TO_CLASSIFY:
+    correlation_times = None
+    converged = False
+    if len(data) >= 8:
+        converged = autocorrelation_converged(data)
+        if converged:
+            tau = integrated_autocorrelation_time(data)
+            correlation_times = len(data) / tau if tau > 0 else None
+
+    too_few = len(data) < MIN_OBSERVATIONS_TO_CLASSIFY
+    # `converged` first: without it the correlation-time count is censored and reads
+    # HIGHER for a shorter sample, which is the opposite of a guard.
+    not_decorrelated = len(data) >= MIN_OBSERVATIONS_TO_CLASSIFY and not converged
+    too_correlated = (
+        correlation_times is not None
+        and correlation_times < MIN_CORRELATION_TIMES_TO_CLASSIFY
+    )
+    if too_few or not_decorrelated or too_correlated:
+        if too_few:
+            reason = (
+                f"{len(data)} observations is too few to distinguish a standing basis "
+                f"from a fluctuating one; {MIN_OBSERVATIONS_TO_CLASSIFY} needed"
+            )
+        elif not_decorrelated and len(set(data)) == 1:
+            # A perfectly constant series never decorrelates, which is arithmetically
+            # true and says nothing about the market. Real dislocations vary; a value
+            # repeated exactly means a feed that stopped moving, and calling that a
+            # standing basis would attribute a market property to a stalled reader.
+            reason = (
+                f"all {len(data)} observations are identical. That is a static feed, not "
+                f"a persistent basis -- a real dislocation varies, and a repeated value "
+                f"carries no information about whether the sign would change"
+            )
+        elif not_decorrelated:
+            reason = (
+                f"the autocorrelation has not decayed within {len(data)} observations, "
+                f"so the correlation time is below the resolution of the sample and so "
+                f"is persistence. A series that has not forgotten its own value cannot "
+                f"be observed to change sign"
+            )
+        else:
+            reason = (
+                f"{len(data)} observations span only {correlation_times:.1f} "
+                f"correlation times; {MIN_CORRELATION_TIMES_TO_CLASSIFY:.0f} are needed "
+                f"before persistence means anything. A series this autocorrelated "
+                f"contains about {correlation_times:.1f} independent draws, and the "
+                f"sign cannot be observed to change in fewer draws than it takes to "
+                f"change"
+            )
         return {
             "kind": "unknown",
             "sign_flip_fraction": None,
             "median_bps": (_stats.median(data) if data else None),
             "flip_threshold": flip_threshold,
             "n": len(data),
+            "correlation_times": correlation_times,
+            "sign_test_p": None,
             "barrier_suspected": None,
             "barrier_threshold_bps": barrier_bps,
-            "reason": (
-                f"{len(data)} observations is too few to distinguish a standing "
-                f"basis from a fluctuating one; {MIN_OBSERVATIONS_TO_CLASSIFY} needed"
-            ),
+            "reason": reason,
         }
 
     positive = sum(1 for v in data if v > 0)
@@ -823,7 +905,15 @@ def classify_dislocation(
     # a fluctuating series has both sides well represented.
     minority = min(positive, negative) / len(data)
 
-    kind = "standing_basis" if minority <= flip_threshold else "fluctuating"
+    # Persistence is a claim about a population, so it needs a test rather than a
+    # threshold. The p-value is computed on the EFFECTIVE sample, so it carries the
+    # sample size with it -- which a bare label does not, and which is how this
+    # classifier previously called a fluctuating market a standing basis on a sample
+    # holding about eleven independent draws.
+    p_value = sign_test_p_value(data)
+    one_sided = minority <= flip_threshold
+    significant = p_value is not None and p_value < 0.05
+    kind = "standing_basis" if (one_sided and significant) else "fluctuating"
     median = _stats.median(data)
 
     # A LARGE gap that never closes is evidence the market cannot close it.
@@ -853,6 +943,8 @@ def classify_dislocation(
         "median_bps": median,
         "flip_threshold": flip_threshold,
         "n": len(data),
+        "correlation_times": correlation_times,
+        "sign_test_p": p_value,
         "barrier_suspected": barrier_suspected,
         "barrier_threshold_bps": barrier_bps,
         "reason": None,
