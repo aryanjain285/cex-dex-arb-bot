@@ -32,9 +32,9 @@ delay is swept, so its cost is measured rather than argued about.
 from __future__ import annotations
 
 import statistics as _stats
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from decimal import Decimal
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from loguru import logger
 
@@ -52,7 +52,10 @@ from .statistics import (
     persistence_runs,
 )
 
-__all__ = ["MarketReport", "analyse_store", "group_key", "format_report"]
+__all__ = [
+    "MarketReport", "analyse_store", "group_key", "format_report",
+    "scrambled_control",
+]
 
 # Thresholds the exceedance curve is reported at, in bps. Chosen to span the
 # decision: 0 is "does the dislocation ever favour us at all", 5 is the configured
@@ -453,3 +456,128 @@ def format_report(report: MarketReport) -> str:
             f"still profitable {profitable_text}"
         )
     return "\n".join(lines)
+
+
+# --- negative control -----------------------------------------------------
+
+
+def scrambled_control(
+    observations: Sequence[Observation],
+    costs: CostModel,
+    notionals: Sequence[Decimal],
+    *,
+    base_is_token0: bool,
+    offset_seconds: float,
+) -> Dict[str, Any]:
+    """Compare the real pairing against a deliberately mismatched one.
+
+    Every other check in this stack is internal: it verifies the code does what it
+    was designed to do. None can tell whether the design measures the market. A sign
+    error, an inverted token order or a mis-specified cost all produce a distribution
+    of "edge" that looks like data.
+
+    So: evaluate each observation's CEX book against a pool snapshot from a distant
+    time. Whatever structure survives cannot be a real dislocation, because the two
+    sides never coexisted. The scrambled distribution's upper tail is then a bound on
+    how much apparent edge pure mismatch can manufacture, and an observed edge below
+    that bound proves nothing whatever its mean.
+
+    The offset is validated against the observed cadence. An earlier placebo in this
+    project used a one-second delay against twelve-second blocks, so 69% of its
+    "placebo" quotes were identical to the real ones and it could not have detected
+    anything.
+    """
+    observations = sorted(observations, key=lambda o: o.ts)
+    empty = {"n": 0, "mean": None, "sd": None, "p50": None, "p90": None, "p99": None}
+
+    cadence = _median_cadence([o.ts for o in observations])
+    if cadence is not None and offset_seconds < cadence * 2:
+        raise ValueError(
+            f"offset_seconds {offset_seconds} is less than twice the observed "
+            f"cadence ({cadence:.1f}s). A scramble shorter than the sampling "
+            f"interval pairs many rows with near-copies of themselves, which is how "
+            f"a placebo comes to measure nothing -- the previous one in this project "
+            f"produced 69% identical pairs and could not have detected anything."
+        )
+
+    def _series(pairs):
+        out = []
+        for book_obs, pool_obs in pairs:
+            merged = _swap_pool(book_obs, pool_obs)
+            result = evaluate_observation(
+                merged, costs, notionals, base_is_token0=base_is_token0
+            )
+            if result.best_gross_bps is not None:
+                out.append(float(result.best_gross_bps))
+        return out
+
+    true_series = _series([(o, o) for o in observations])
+
+    # Pair each book with the pool snapshot `offset_seconds` later, wrapping around.
+    # Wrapping rather than truncating so the two samples have the same size and the
+    # comparison is not also a comparison of sample lengths.
+    scrambled_pairs = []
+    identical = 0
+    for observation in observations:
+        target = observation.ts + offset_seconds
+        span = observations[-1].ts - observations[0].ts
+        if span > 0 and target > observations[-1].ts:
+            target = observations[0].ts + ((target - observations[0].ts) % span)
+        partner = min(observations, key=lambda o: abs(o.ts - target))
+        if partner.ts == observation.ts:
+            identical += 1
+        scrambled_pairs.append((observation, partner))
+
+    reason = None
+    if len(observations) < 3:
+        scrambled_series = []
+        reason = (
+            f"only {len(observations)} observations; a scramble needs enough of a "
+            f"span that the mismatched pairs are genuinely from different times"
+        )
+    else:
+        scrambled_series = _series(scrambled_pairs)
+        if identical:
+            reason = (
+                f"{identical} of {len(observations)} scrambled pairs reproduced the "
+                f"true pairing, so the control is diluted by that fraction"
+            )
+
+    true_stats = describe(true_series) if true_series else dict(empty)
+    scrambled_stats = describe(scrambled_series) if scrambled_series else dict(empty)
+
+    noise_bound = scrambled_stats.get("p99")
+    exceeds = None
+    if noise_bound is not None and true_stats.get("p99") is not None:
+        # The question that matters: is the real tail heavier than what mismatch
+        # alone produces? If not, observations above that level prove nothing.
+        exceeds = true_stats["p99"] > noise_bound
+
+    return {
+        "true": true_stats,
+        "scrambled": scrambled_stats,
+        "offset_seconds": offset_seconds,
+        "median_cadence_seconds": cadence,
+        "identical_pairs": identical,
+        # The level below which an apparent edge is indistinguishable from noise.
+        "noise_bound_bps": noise_bound,
+        "exceeds_noise": exceeds,
+        "reason": reason,
+    }
+
+
+def _swap_pool(book_observation: Observation, pool_observation: Observation) -> Observation:
+    """A book from one instant with a pool from another.
+
+    Built by replacement rather than by constructing a new Observation field-by-field
+    so that any field added later is carried across automatically -- a scramble that
+    silently dropped a new field would differ from the real evaluation in more ways
+    than the one under test.
+    """
+    if pool_observation is book_observation:
+        return book_observation
+    return replace(
+        book_observation,
+        pool=pool_observation.pool,
+        gas_price_wei=pool_observation.gas_price_wei,
+    )

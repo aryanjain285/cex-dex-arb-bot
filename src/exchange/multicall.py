@@ -71,10 +71,13 @@ MULTICALL3_ABI = [
     }
 ]
 
-# Calls per batch. Bounded by the node's response size and gas limit for an
-# eth_call, not by the contract. 200 x 32-byte returns is ~7KB, comfortably inside
-# any provider's limit, and keeps a single failed batch cheap to retry.
-DEFAULT_MAX_BATCH = 200
+# Calls per batch. Bounded by what the NODE will accept for one eth_call, not by
+# the contract. The binding limit turned out to be compute rather than response
+# size: a 160-sub-call aggregate3 is a heavy eth_call, and public endpoints reject
+# it -- Base refused every one at 3 req/s. Smaller batches cost a handful of extra
+# round trips (a 160-tick pool goes from ~9 calls to ~12, against 172 unbatched) and
+# are far more likely to be served at all. Availability beats optimality here.
+DEFAULT_MAX_BATCH = 60
 
 Call = Tuple[str, bytes]
 

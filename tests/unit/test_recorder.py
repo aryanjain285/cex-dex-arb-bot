@@ -96,13 +96,24 @@ class FakeGas:
 
 
 def _target(symbol="ETHUSDT", address="0x" + "ab" * 20):
-    class Pair:
-        cex_symbol = symbol
-        base = "ETH"
-        quote = "USDT"
-        dex_chain = "ethereum"
-        dex_pool_fee = 500
-    return RecorderTarget(pair=Pair(), pool_address=address)
+    """The REAL MarketPair, not a stand-in.
+
+    An earlier version of this fixture was an ad-hoc class with the attributes the
+    recorder happened to read, including a `quote` field MarketPair does not have --
+    it distinguishes `quote_cex` from `quote_dex`. Every test passed and the live
+    recorder failed 100% of its observations with AttributeError, which the failure
+    counting caught and the DEBUG-level log hid. A fake that defines its own contract
+    tests the fake.
+    """
+    from src.core.types import MarketPair
+
+    return RecorderTarget(
+        pair=MarketPair(
+            base="ETH", quote_cex="USDT", quote_dex="USDT",
+            cex_symbol=symbol, dex_chain="ethereum", dex_pool_fee=500,
+        ),
+        pool_address=address,
+    )
 
 
 @pytest.fixture
@@ -258,3 +269,141 @@ class TestNoTargets:
         with pytest.raises(ValueError, match="no targets"):
             Recorder(store=store, cex=FakeCex(), pools=FakePools(),
                      gas=FakeGas(), targets=[])
+
+
+class TestSlowTargetsDoNotBlockFastOnes:
+    """A cycle must not be as slow as its slowest pool.
+
+    Measured cost of a full pool read, 2026-08-18: 14-16s on Arbitrum, 34-131s on
+    Ethereum and Base -- per-call latency on public endpoints, not rate limiting.
+    Tick data is re-read on a timer, so every few minutes some pool pays that cost.
+    If the cycle collected all results before writing any, then Arbitrum's twelve
+    fast observations would be discarded down to one, because they waited for a Base
+    pool that took two minutes.
+
+    The consequence is not just fewer rows. It is a sampling rate that varies with
+    the slowest endpoint in the set, so the cadence -- and therefore every
+    per-second and lifetime statistic -- would be set by whichever chain is worst.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_fast_target_is_written_before_a_slow_one_finishes(self, store):
+        released = asyncio.Event()
+
+        class MixedSpeed(FakePools):
+            async def get(self, chain, address, **kwargs):
+                self.calls += 1
+                if address.endswith("cd" * 2):
+                    await released.wait()
+                return _pool()
+
+        recorder = Recorder(
+            store=store, cex=FakeCex(), pools=MixedSpeed(), gas=FakeGas(),
+            targets=[_target("ETHUSDT", "0x" + "ab" * 20),
+                     _target("ARBUSDT", "0x" + "cd" * 20)],
+        )
+        task = asyncio.create_task(recorder.cycle())
+
+        # Give the fast target a chance to complete and be written.
+        for _ in range(50):
+            await asyncio.sleep(0)
+            if store.count() >= 1:
+                break
+
+        assert store.count() == 1, (
+            "the fast pool's observation was not written while the slow pool was "
+            "still reading; a slow endpoint would set the cadence for every chain"
+        )
+        released.set()
+        await asyncio.wait_for(task, timeout=5)
+        assert store.count() == 2
+
+    @pytest.mark.asyncio
+    async def test_every_observation_still_arrives_exactly_once(self, store):
+        """Writing incrementally must not duplicate or drop rows."""
+        recorder = Recorder(
+            store=store, cex=FakeCex(), pools=FakePools(), gas=FakeGas(),
+            targets=[_target(f"SYM{i}", "0x" + f"{i:02d}" * 20) for i in range(6)],
+        )
+        await recorder.cycle()
+        assert store.count() == 6
+        assert len(set(store.pairs())) == 6
+
+
+class TestTheRecorderRefreshesRatherThanReadsTheCache:
+    """A recorder that re-serves cached state records the same instant repeatedly.
+
+    `PoolStateCache.get` returns the held snapshot untouched; `refresh` re-reads
+    slot0 -- the price and active liquidity, two calls. A first run of this recorder
+    reported 22 full reads, 0 cheap refreshes, and 44 observations: the second cycle
+    recorded byte-identical pool state.
+
+    Nothing about that looks wrong in the output. The row count grows, the timestamps
+    advance, and every downstream statistic is silently poisoned: the autocorrelation
+    goes to 1, so the effective sample size collapses toward one, and opportunity
+    lifetimes become however long the recorder ran. A dataset that says the price
+    never moved is worse than a smaller one.
+    """
+
+    @pytest.mark.asyncio
+    async def test_each_cycle_re_reads_the_pool(self, store):
+        class CountingPools(FakePools):
+            def __init__(self):
+                super().__init__()
+                self.gets = 0
+                self.refreshes = 0
+
+            async def get(self, chain, address, **kwargs):
+                self.gets += 1
+                return _pool()
+
+            async def refresh(self, chain, address, **kwargs):
+                self.refreshes += 1
+                return _pool(tick=self.refreshes)
+
+        pools = CountingPools()
+        recorder = Recorder(store=store, cex=FakeCex(), pools=pools,
+                            gas=FakeGas(), targets=[_target()])
+        await recorder.cycle()
+        await recorder.cycle()
+
+        assert pools.refreshes >= 1, (
+            "the recorder must call refresh(), not get(); get() re-serves the held "
+            "snapshot and records the same instant twice"
+        )
+
+    @pytest.mark.asyncio
+    async def test_consecutive_observations_differ(self, store):
+        """The property that matters, stated on the data rather than the call count."""
+        class MovingPools(FakePools):
+            def __init__(self):
+                super().__init__()
+                self.n = 0
+
+            async def refresh(self, chain, address, **kwargs):
+                self.n += 1
+                return _pool(tick=self.n * 10)
+
+            async def get(self, chain, address, **kwargs):
+                return await self.refresh(chain, address, **kwargs)
+
+        recorder = Recorder(store=store, cex=FakeCex(), pools=MovingPools(),
+                            gas=FakeGas(), targets=[_target()])
+        await recorder.cycle()
+        await recorder.cycle()
+
+        prices = [o.pool.sqrt_price_x96 for o in store.read_all()]
+        assert len(prices) == 2
+        assert prices[0] != prices[1], (
+            "two cycles recorded the same pool price; the store is accumulating "
+            "copies rather than observations"
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_reader_without_refresh_still_works(self, store):
+        """Not every pool source has a cheap path. Falling back to get() is correct;
+        silently doing nothing is not."""
+        recorder = Recorder(store=store, cex=FakeCex(), pools=FakePools(),
+                            gas=FakeGas(), targets=[_target()])
+        await recorder.cycle()
+        assert store.count() == 1

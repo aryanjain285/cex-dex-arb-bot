@@ -89,10 +89,22 @@ class GasReader:
         return int(gas_price), native_price
 
     async def _native_price(self, chain: str) -> Optional[Decimal]:
-        getter = getattr(self._dex, "get_native_price_quote", None)
-        if getter is None:
+        """The native token's price, used to convert gas into the quote currency.
+
+        Sourced from the client's own NativePriceOracle so a recording run prices gas
+        exactly the way the live detector does -- a research figure computed from a
+        different price source would not be comparable to a live decision.
+
+        A USD price stands in for a USDT/USDC price. That is an approximation worth
+        naming: the two have diverged by tens of basis points in stress, and gas is a
+        cost line here rather than a traded leg, so the error enters the cost estimate
+        rather than the edge. Returns None when unavailable, and None must not become
+        zero downstream.
+        """
+        oracle = getattr(self._dex, "price_oracle", None)
+        if oracle is None:
             return None
-        return await getter(chain)
+        return await oracle.get_usd_price(chain)
 
 
 class Recorder:
@@ -142,31 +154,45 @@ class Recorder:
         if len(self._cycle_starts) > self._cadence_window:
             del self._cycle_starts[0]
 
-        # return_exceptions: one target's failure must not cancel its siblings.
-        # Without this, `gather` propagates the first exception and cancels the
-        # rest -- so a single bad endpoint silently reduces the recording to
-        # whichever pairs come before it.
-        results = await asyncio.gather(
-            *(self._observe(target) for target in self.targets),
-            return_exceptions=True,
-        )
-
-        observations: List[Observation] = []
-        for target, result in zip(self.targets, results):
-            symbol = target.pair.cex_symbol
-            if isinstance(result, BaseException):
-                self._count_failure(symbol, result)
+        # Each observation is written AS IT COMPLETES, not after all of them.
+        # Measured full-read cost, 2026-08-18: 14-16s on Arbitrum against 34-131s on
+        # Ethereum and Base -- per-call latency, not rate limiting. Tick data is
+        # re-read on a timer, so some pool pays that cost every few minutes. Waiting
+        # for the whole set would throw away Arbitrum's twelve fast observations
+        # because a Base pool took two minutes, and would set the sampling cadence
+        # for every chain by whichever endpoint is worst -- which then sets every
+        # per-second and lifetime statistic derived from it.
+        tasks = [
+            asyncio.ensure_future(self._observe_isolated(target))
+            for target in self.targets
+        ]
+        written = 0
+        for completed in asyncio.as_completed(tasks):
+            observation = await completed
+            if observation is None:
+                # `_observe_isolated` has already counted and explained it.
                 continue
-            if result is None:
-                # `_observe` already counted and explained it.
-                continue
-            observations.append(result)
+            self.store.record(observation)
+            self._recorded += 1
+            written += 1
 
-        if observations:
-            self.store.record_many(observations)
-            self._recorded += len(observations)
         self._cycles += 1
-        return len(observations)
+        return written
+
+    async def _observe_isolated(self, target: RecorderTarget) -> Optional[Observation]:
+        """`_observe`, with failures counted rather than propagated.
+
+        The isolation lives here rather than in a `gather(return_exceptions=True)`
+        because `as_completed` gives back futures without their targets, and a
+        failure has to be attributed to the pair that produced it.
+        """
+        try:
+            return await self._observe(target)
+        except asyncio.CancelledError:
+            raise
+        except BaseException as exc:  # noqa: BLE001 - one target must not stop the rest
+            self._count_failure(target.pair.cex_symbol, exc)
+            return None
 
     async def _observe(self, target: RecorderTarget) -> Optional[Observation]:
         pair = target.pair
@@ -177,10 +203,7 @@ class Recorder:
         # the RPC latency between them. On a public endpoint that is seconds, which
         # is longer than the edge survives.
         book_task = self._read_book(pair)
-        pool_task = self.pools.get(
-            pair.dex_chain, target.pool_address,
-            decimals0=None, decimals1=None,
-        )
+        pool_task = self._read_pool(target)
         book, pool = await asyncio.gather(book_task, pool_task)
 
         if book is None or not book.bids or not book.asks:
@@ -201,7 +224,11 @@ class Recorder:
             ts=time.time(),
             cex_symbol=symbol,
             base=pair.base,
-            quote=pair.quote,
+            # `quote_cex`, not `quote`: MarketPair distinguishes the CEX quote from
+            # the DEX one, because a synthetic route trades through an intermediate
+            # asset and the two differ. The CEX quote is what the recorded ladder is
+            # denominated in, which is what the observation's prices mean.
+            quote=pair.quote_cex,
             chain=pair.dex_chain,
             pool_fee=int(pair.dex_pool_fee),
             pool_address=target.pool_address,
@@ -217,6 +244,33 @@ class Recorder:
 
     async def _read_book(self, pair):
         return await self.cex.get_book(pair)
+
+    async def _read_pool(self, target: RecorderTarget):
+        """`refresh`, not `get`.
+
+        `get` returns the held snapshot untouched; `refresh` re-reads slot0 -- the
+        price and active liquidity -- for two calls, and re-reads ticks only when the
+        price has left the observed window or the tick data has aged out.
+
+        A first run of this recorder used `get` and reported 22 full reads, 0 cheap
+        refreshes, 44 observations: the second cycle recorded byte-identical pool
+        state. Nothing about that looks wrong in the output -- rows accumulate,
+        timestamps advance -- while every downstream statistic is poisoned. The
+        autocorrelation goes to 1, so the effective sample size collapses toward one,
+        and opportunity lifetimes become however long the recorder ran.
+        """
+        refresh = getattr(self.pools, "refresh", None)
+        if refresh is not None:
+            return await refresh(
+                target.pair.dex_chain, target.pool_address,
+                decimals0=None, decimals1=None,
+            )
+        # A pool source with no cheap path still has to work; only doing nothing is
+        # unacceptable.
+        return await self.pools.get(
+            target.pair.dex_chain, target.pool_address,
+            decimals0=None, decimals1=None,
+        )
 
     def _endpoint_for(self, chain: str) -> Optional[str]:
         """Which endpoint answered, so numbers from different runs are comparable.
