@@ -77,6 +77,7 @@ def main():
 
     series = defaultdict(list)
     gas_bps = defaultdict(list)
+    priceable = defaultdict(list)
     for observation in store.read_all():
         key = group_key(observation)
         target = targets.get(key)
@@ -89,6 +90,17 @@ def main():
         if value is None:
             continue
         series[key].append(abs(float(value)))
+        # Can the pool actually price the target notional? A raw mid-to-mid gap is not
+        # tradeable if no size fits, and thin pools produce LARGE gaps precisely because
+        # nobody arbitrages a pool they cannot trade in. Without this, ARB/USDC 0.05%
+        # reports 11.36 bps of headroom on a pool measured at -1,184 bps of impact at
+        # $1,000.
+        priceable[key].append(
+            observation.pool.price_for_amount_in(
+                Decimal("1000") / (observation.cex_mid or Decimal(1)),
+                zero_for_one=base_is_token0,
+            ) is not None
+        )
         gas = observation.gas_quote(args.gas_units)
         if gas is not None:
             # As a fraction of a $1,000 notional, which is the configured target size.
@@ -106,8 +118,17 @@ def main():
         gas = statistics.median(gas_bps[key]) if gas_bps[key] else 0.0
         label = f"{key[0]} {key[1]} {key[2]}"
         print(f"=== {label} ===")
+        fillable = (
+            sum(priceable[key]) / len(priceable[key]) if priceable[key] else 0.0
+        )
         print(f"  {len(values):,} observations, pool fee {pool_fee_bps:.2f} bps, "
-              f"gas {gas:.2f} bps at $1,000")
+              f"gas {gas:.2f} bps at $1,000, "
+              f"{fillable:.0%} of observations can price $1,000")
+        if fillable < 0.5:
+            print(f"  NOT TRADEABLE: this pool cannot price the target notional in "
+                  f"{1 - fillable:.0%} of observations, so its gap is a mid-to-mid")
+            print(f"  number with no size behind it. A thin pool shows a LARGE gap "
+                  f"precisely because nobody arbitrages a pool they cannot trade in.")
         print(f"  {'percentile':<12} {'|dislocation|':>14} {'max CEX fee that clears':>26}")
         for name, p in (("median", 0.50), ("p75", 0.75), ("p90", 0.90),
                         ("p99", 0.99), ("max", 1.0)):
