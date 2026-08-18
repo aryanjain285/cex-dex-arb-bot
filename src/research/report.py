@@ -41,10 +41,11 @@ from loguru import logger
 from .evaluate import (
     CostModel,
     ObservationResult,
+    best_priceable_decision,
     evaluate_observation,
     resolve_with_latency,
 )
-from .observations import Observation, ObservationStore
+from .observations import Observation, ObservationStore, mid_dislocation_bps
 from .statistics import (
     batch_means_interval,
     describe,
@@ -54,7 +55,8 @@ from .statistics import (
 
 __all__ = [
     "MarketReport", "analyse_store", "group_key", "format_report",
-    "scrambled_control",
+    "scrambled_control", "format_summary_table", "classify_dislocation",
+    "BASIS_FLIP_THRESHOLD",
 ]
 
 # Thresholds the exceedance curve is reported at, in bps. Chosen to span the
@@ -95,6 +97,17 @@ class MarketReport:
     endpoints: Tuple[str, ...] = ()
 
     # -- the research signal
+    # The RAW dislocation: pool mid against CEX mid, before any fee, spread, impact
+    # or direction choice. The only figure here with nothing subtracted from it, and
+    # therefore the one that says whether the phenomenon exists at all. A negative
+    # best-gross is ambiguous between "the venues are at parity and the fees are
+    # unavoidable" and "the venues disagree, just not enough"; those have opposite
+    # implications and only this separates them.
+    dislocation_bps: Dict[str, Optional[float]] = field(default_factory=dict)
+    abs_dislocation_bps: Dict[str, Optional[float]] = field(default_factory=dict)
+    # Standing basis or fluctuating dislocation. The same +3 bps reads as a highly
+    # reliable signal under one and as an unharvestable price under the other.
+    basis_kind: Dict[str, Any] = field(default_factory=dict)
     gross_bps: Dict[str, Optional[float]] = field(default_factory=dict)
     gross_interval: Dict[str, Optional[float]] = field(default_factory=dict)
     net_bps: Dict[str, Optional[float]] = field(default_factory=dict)
@@ -186,6 +199,12 @@ def _analyse_market(
             continue
         results.append(result)
 
+    dislocations = []
+    for observation in observations:
+        value = mid_dislocation_bps(observation, base_is_token0)
+        if value is not None:
+            dislocations.append(float(value))
+
     gross_series = [
         float(r.best_gross_bps) for r in results if r.best_gross_bps is not None
     ]
@@ -243,6 +262,11 @@ def _analyse_market(
         endpoints=tuple(sorted({
             o.rpc_endpoint for o in observations if o.rpc_endpoint
         })),
+        dislocation_bps=describe(dislocations),
+        basis_kind=classify_dislocation(dislocations),
+        # Magnitude, because either sign is tradeable in principle: the feasibility
+        # question is whether |dislocation| ever exceeds the round-trip cost.
+        abs_dislocation_bps=describe([abs(v) for v in dislocations]),
         gross_bps=describe(gross_series),
         gross_interval=batch_means_interval(gross_series),
         net_bps=describe(net_series),
@@ -320,12 +344,30 @@ def _latency_study(
     """
     tolerance = max(0.5, (cadence or 1.0) * 1.0)
     decided = [r for r in results if r.best is not None]
+    basis = "tradeable"
+
+    if not decided:
+        # No observation cleared the floor -- which is every market in this dataset.
+        # Fall back to the best PRICEABLE size: "had you traded the best available
+        # size at t, what would it have been worth at t+delta". A counterfactual, so
+        # the basis is reported alongside; without it the cost of latency goes
+        # unmeasured for want of a qualifying trade, and that cost is one of the two
+        # things the research exists to establish.
+        basis = "counterfactual: best priceable size, floor ignored"
+        decided = []
+        for result in results:
+            counterfactual = best_priceable_decision(result)
+            if counterfactual is None:
+                continue
+            decided.append(replace(result, best=counterfactual))
+
     if not decided:
         return {
             "decisions": 0, "resolved": 0, "unresolved": 0,
             "mean_realised_net_bps": None, "median_realised_net_bps": None,
             "mean_decay_bps": None, "mean_realised_delay_seconds": None,
             "fraction_still_profitable": None, "tolerance_seconds": tolerance,
+            "basis": "none: no size on the grid could be priced",
         }
 
     realised, decays, delays_seen = [], [], []
@@ -361,6 +403,10 @@ def _latency_study(
             sum(1 for v in realised if v > 0) / len(realised) if realised else None
         ),
         "tolerance_seconds": tolerance,
+        # Which set of decisions this was computed on. A latency figure from
+        # hypothetical trades is not the same statement as one from real ones, and
+        # nothing downstream can tell them apart without this.
+        "basis": basis,
     }
 
 
@@ -388,6 +434,54 @@ def format_report(report: MarketReport) -> str:
             f"(no gas price / one-sided book), {report.unpriceable:,} unpriceable "
             f"(pool too thin, or outside the observed tick window)"
         )
+
+    raw, absraw = report.dislocation_bps, report.abs_dislocation_bps
+    if raw.get("n"):
+        lines.append(
+            f"  RAW dislocation (pool mid vs CEX mid, no fees at all)"
+        )
+        lines.append(
+            f"              signed  mean {_fmt(raw.get('mean'))}  "
+            f"p1 {_fmt(raw.get('p1'))}  p99 {_fmt(raw.get('p99'))}"
+        )
+        lines.append(
+            f"              |size|  median {_fmt(absraw.get('p50'))}  "
+            f"p90 {_fmt(absraw.get('p90'))}  p99 {_fmt(absraw.get('p99'))}  "
+            f"max {_fmt(absraw.get('max'))}"
+        )
+        # The comparison that decides feasibility, stated rather than left implied.
+        round_trip = float(report.pool_fee) / 100.0 + float(report.costs.taker_fee_bps)
+        median_abs = absraw.get("p50") or 0.0
+        shortfall = round_trip / median_abs if median_abs > 0 else None
+        lines.append(
+            f"              a one-way trade must clear {round_trip:.1f} bps "
+            f"(pool fee {report.pool_fee / 100:.0f} + taker "
+            f"{report.costs.taker_fee_bps})"
+            + (
+                f"; the median dislocation is {shortfall:.1f}x too small"
+                if shortfall and shortfall > 1
+                else "; the median dislocation clears it"
+            )
+        )
+        kind = report.basis_kind.get("kind")
+        if kind == "standing_basis":
+            lines.append(
+                f"              STANDING BASIS: the sign flips in only "
+                f"{report.basis_kind['sign_flip_fraction']:.1%} of observations. "
+                f"This is a price, not an error -- what the market charges for the "
+                f"asset being on this chain rather than in that custodian. Capturing "
+                f"it once is an inventory move; capturing it again needs the "
+                f"inventory bridged back, and the bridge costs the basis. NOT a "
+                f"repeatable per-trade edge."
+            )
+        elif kind == "fluctuating":
+            lines.append(
+                f"              fluctuating: the sign flips in "
+                f"{report.basis_kind['sign_flip_fraction']:.1%} of observations, so "
+                f"inventory returns on its own and the constraint is cost"
+            )
+        elif report.basis_kind.get("reason"):
+            lines.append(f"              basis: {report.basis_kind['reason']}")
 
     gross, gi = report.gross_bps, report.gross_interval
     lines.append(
@@ -454,6 +548,7 @@ def format_report(report: MarketReport) -> str:
             f"realised net {_fmt(stat['mean_realised_net_bps'])} bps  "
             f"decay {_fmt(stat['mean_decay_bps'])} bps  "
             f"still profitable {profitable_text}"
+            + (f"  [{stat['basis']}]" if stat.get("basis") != "tradeable" else "")
         )
     return "\n".join(lines)
 
@@ -581,3 +676,107 @@ def _swap_pool(book_observation: Observation, pool_observation: Observation) -> 
         pool=pool_observation.pool,
         gas_price_wei=pool_observation.gas_price_wei,
     )
+
+
+def format_summary_table(reports: Sequence[MarketReport]) -> str:
+    """One line per market, sorted by the best gross edge observed.
+
+    Sorted by GROSS rather than net because gross is the research signal: it says
+    whether the phenomenon exists, separately from whether this cost structure can
+    capture it. Sorting by net would rank the markets by our own fee assumptions and
+    bury a genuinely dislocated pool behind a cheap one that never moves.
+
+    `obs` and `eff` both appear because the gap between them is the finding half the
+    time. 800 observations carrying 40 independent facts and 800 carrying 780 support
+    very different claims, and only one number distinguishes them.
+    """
+    lines = [
+        f"{'market':<30} {'obs':>6} {'eff':>5} {'gross':>8} {'p99':>8} "
+        f"{'net':>8} {'>5bps':>8} {'life':>7} {'unpr':>6}",
+        "-" * 96,
+    ]
+    ordered = sorted(
+        reports,
+        key=lambda r: (r.gross_bps.get("mean") is None, -(r.gross_bps.get("mean") or 0)),
+    )
+    for report in ordered:
+        label = f"{report.cex_symbol} {report.chain} {report.pool_fee}"
+        gross = report.gross_bps
+        exceed = report.exceedance_net.get(5.0)
+        lines.append(
+            f"{label:<30} {report.observations:>6,} "
+            f"{report.gross_interval.get('effective_n') or 0:>5,} "
+            f"{_fmt(gross.get('mean')):>8} {_fmt(gross.get('p99')):>8} "
+            f"{_fmt(report.net_bps.get('mean')):>8} "
+            f"{('-' if exceed is None else f'{exceed:.3%}'):>8} "
+            f"{_fmt(report.median_lifetime_seconds, '.0f'):>7} "
+            f"{report.unpriceable:>6,}"
+        )
+    lines.append("")
+    lines.append(
+        "gross/net/p99 in bps, best of both directions at the best size on the grid. "
+        "life = median seconds an opportunity persists. unpr = observations no size "
+        "on the grid could price, which is not evidence of no edge."
+    )
+    return "\n".join(lines)
+
+
+# --- standing basis versus fluctuating dislocation ------------------------
+
+# Below this fraction of sign changes, a dislocation is treated as a standing basis
+# rather than something a taker can harvest repeatedly. 5% is deliberately
+# conservative: it takes a genuinely one-sided series to earn the label, because the
+# label is the stronger claim.
+BASIS_FLIP_THRESHOLD = 0.05
+
+# Fewer observations than this and the question is not asked. Three readings sharing a
+# sign are not evidence of a standing basis, and calling them one would be the
+# strongest available conclusion from the weakest available sample.
+MIN_OBSERVATIONS_TO_CLASSIFY = 20
+
+
+def classify_dislocation(values, flip_threshold: float = BASIS_FLIP_THRESHOLD):
+    """Standing basis, or fluctuating dislocation? They mean opposite things.
+
+    FLUCTUATING: the sign changes. The pool crosses the exchange price in both
+    directions, so a taker buys on whichever venue is cheap and sells on the other,
+    and inventory returns on its own. The binding constraint is cost.
+
+    STANDING: the sign does not change. The pool is persistently richer or cheaper,
+    which is a price rather than an error -- what the market charges for the asset
+    being on that chain instead of in that custodian. Capturing it once is an
+    inventory repositioning; capturing it twice needs the inventory moved back across
+    the bridge, and the bridge costs the basis. That is why the basis exists.
+
+    The distinction matters because it inverts how the same number reads. A report
+    showing "+3 bps, 100% of observations, on both ETH pairs" looks like an unusually
+    reliable signal. It is the opposite: a signal that cannot be harvested repeatedly.
+    """
+    data = [float(v) for v in values if v is not None]
+    if len(data) < MIN_OBSERVATIONS_TO_CLASSIFY:
+        return {
+            "kind": "unknown",
+            "sign_flip_fraction": None,
+            "median_bps": (_stats.median(data) if data else None),
+            "flip_threshold": flip_threshold,
+            "n": len(data),
+            "reason": (
+                f"{len(data)} observations is too few to distinguish a standing "
+                f"basis from a fluctuating one; {MIN_OBSERVATIONS_TO_CLASSIFY} needed"
+            ),
+        }
+
+    positive = sum(1 for v in data if v > 0)
+    negative = sum(1 for v in data if v < 0)
+    # The fraction on the MINORITY side. A basis is one-sided, so this is near zero;
+    # a fluctuating series has both sides well represented.
+    minority = min(positive, negative) / len(data)
+
+    return {
+        "kind": "standing_basis" if minority <= flip_threshold else "fluctuating",
+        "sign_flip_fraction": minority,
+        "median_bps": _stats.median(data),
+        "flip_threshold": flip_threshold,
+        "n": len(data),
+        "reason": None,
+    }

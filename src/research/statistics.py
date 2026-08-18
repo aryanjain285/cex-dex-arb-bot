@@ -44,6 +44,8 @@ __all__ = [
     "effective_sample_size",
     "batch_means_interval",
     "persistence_runs",
+    "decay_profile",
+    "half_life_seconds",
 ]
 
 Number = Union[float, int, Decimal]
@@ -341,3 +343,62 @@ def persistence_runs(flags: Sequence[bool]) -> List[int]:
     if current:
         runs.append(current)
     return runs
+
+
+def decay_profile(
+    values: Sequence[Number],
+    cadence_seconds: float,
+    lags_seconds: Sequence[float] = (2.0, 5.0, 12.0, 30.0, 60.0, 300.0),
+) -> Dict[float, Optional[float]]:
+    """Autocorrelation of a series at lags expressed in SECONDS.
+
+    This is the number that decides whether a detection loop is fast enough. An edge
+    whose autocorrelation has fallen to zero by 12 seconds cannot be captured by a
+    system that settles on a 12-second block, however good its cost model. Stated in
+    seconds rather than in observations because the cadence differs between runs and
+    is itself a measured quantity -- reporting "correlation 0.4 at lag 1" invites the
+    reader to supply their own cadence, which is how a 2.3s figure and a 36s figure
+    get compared as if they were the same.
+
+    A lag shorter than the cadence is UNMEASURABLE and returns None rather than the
+    lag-1 value. Rounding a 2-second question up to a 36-second answer is how the
+    previous placebo in this project came to compare each quote with a copy of itself.
+    """
+    if cadence_seconds <= 0:
+        raise ValueError(f"cadence_seconds must be positive, got {cadence_seconds}")
+    out: Dict[float, Optional[float]] = {}
+    for lag_seconds in lags_seconds:
+        if lag_seconds < cadence_seconds:
+            out[float(lag_seconds)] = None
+            continue
+        lag = int(round(lag_seconds / cadence_seconds))
+        out[float(lag_seconds)] = autocorrelation(values, max(1, lag))
+    return out
+
+
+def half_life_seconds(
+    values: Sequence[Number], cadence_seconds: float, max_lag_seconds: float = 600.0
+) -> Optional[float]:
+    """How long until the autocorrelation first falls below 0.5, in seconds.
+
+    A compact summary of the decay profile, and the direct answer to "how long does an
+    opportunity stay an opportunity". Returns None when the series never decays that
+    far within the window -- a persistent basis rather than a fleeting dislocation,
+    which is a different phenomenon and must not be reported as a very long half-life.
+    """
+    if cadence_seconds <= 0:
+        raise ValueError("cadence_seconds must be positive")
+    max_lag = int(max_lag_seconds / cadence_seconds)
+    previous_lag, previous_rho = 0.0, 1.0
+    for lag in range(1, max(2, max_lag) + 1):
+        rho = autocorrelation(values, lag)
+        if rho is None:
+            return None
+        if rho < 0.5:
+            # Linear interpolation between the bracketing lags, so the answer is not
+            # quantised to the sampling interval.
+            span = previous_rho - rho
+            fraction = (previous_rho - 0.5) / span if span > 0 else 0.0
+            return (previous_lag + fraction) * cadence_seconds
+        previous_lag, previous_rho = float(lag), rho
+    return None

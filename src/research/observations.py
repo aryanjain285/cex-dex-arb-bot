@@ -45,7 +45,10 @@ from loguru import logger
 
 from ..exchange.pool_state import PoolSnapshot
 
-__all__ = ["Observation", "ObservationStore", "SCHEMA_VERSION"]
+__all__ = [
+    "Observation", "ObservationStore", "SCHEMA_VERSION",
+    "mid_dislocation_bps",
+]
 
 # Bumped when the meaning of a column changes. Additive columns do not need it;
 # a reinterpretation of existing data does, because otherwise two incompatible
@@ -392,3 +395,37 @@ class ObservationStore:
 
     def __exit__(self, *exc) -> None:
         self.close()
+
+
+def mid_dislocation_bps(
+    observation: "Observation", base_is_token0: bool
+) -> Optional[Decimal]:
+    """Pool mid against CEX mid, in bps. No fee, no spread, no impact, no direction.
+
+    The cleanest possible statement of the phenomenon, and the one that decides
+    whether ANY cost structure could work. Every other figure in the report has
+    something subtracted from it:
+
+        best gross   includes the pool fee, half the CEX spread, and price impact,
+                     and is a max over two directions so noise is rectified into it
+        net          adds the taker fee and gas
+
+    So a negative best-gross can mean "the venues are at parity and the fees are
+    unavoidable" or "the venues genuinely disagree but not enough". Those have opposite
+    implications -- the first is unfixable by any execution improvement, the second is
+    a fee and universe problem -- and only the raw dislocation separates them.
+
+    Signed: positive means the pool is above the CEX. The magnitude is what matters
+    for feasibility, since either sign is tradeable in principle.
+    """
+    mid = observation.cex_mid
+    if mid is None or mid <= 0:
+        return None
+    spot = observation.pool.spot_price()  # token0 in token1
+    if spot is None or spot <= 0:
+        return None
+    # spot_price is token0-in-token1. Quote-per-base is that when base is token0, and
+    # its reciprocal otherwise -- the same orientation question that produced a
+    # 36-billion-bps reading in the optimiser before it was made explicit.
+    pool_price = spot if base_is_token0 else (Decimal(1) / spot)
+    return (pool_price - mid) / mid * Decimal(10000)

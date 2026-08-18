@@ -28,6 +28,7 @@ from src.exchange.pool_state import PoolSnapshot
 from src.exchange.univ3_math import TickInfo, sqrt_price_x96_from_tick
 from src.research.evaluate import (
     CostModel,
+    ObservationResult,
     evaluate_observation,
     resolve_with_latency,
 )
@@ -268,3 +269,71 @@ class TestCostModel:
             taker_fee_bps=Decimal("7.5"), cex_legs=1, gas_units=200_000,
             rotation_cost_quote=Decimal("0"), floor_bps=Decimal("5"),
         ))
+
+
+class TestLatencyWithoutATradeableEdge:
+    """The latency study must work on markets where nothing clears the floor.
+
+    Otherwise it is empty on every market in this dataset -- there are no tradeable
+    opportunities anywhere -- and the cost of latency, one of the two things the
+    research exists to measure, goes unmeasured for want of a trade to measure it on.
+
+    The substitute is the best PRICEABLE size rather than the best floor-clearing one:
+    "had you traded the best available size at t, what would it have been worth at
+    t+delta". That is a counterfactual, not a trade, so the basis is reported with the
+    result -- a latency figure computed on hypothetical trades must not be read as one
+    computed on real ones.
+    """
+
+    def test_a_decision_can_be_built_from_the_best_priceable_point(self):
+        from src.research.evaluate import best_priceable_decision
+
+        result = evaluate_observation(_obs(), COSTS, NOTIONALS, base_is_token0=True)
+        assert result.best is None, "this fixture is deliberately not tradeable"
+        counterfactual = best_priceable_decision(result)
+        assert counterfactual is not None
+        assert counterfactual.direction in ("CEX_to_DEX", "DEX_to_CEX")
+        assert counterfactual.size_base > 0
+
+    def test_it_prefers_the_genuinely_best_point_over_the_first_one(self):
+        from src.research.evaluate import best_priceable_decision
+
+        result = evaluate_observation(
+            _obs(cex=Decimal("1900"), dex=Decimal("1904")),
+            COSTS, NOTIONALS, base_is_token0=True,
+        )
+        counterfactual = best_priceable_decision(result)
+        every_net = [
+            p.net_bps for curve in result.curves.values() for p in curve.curve
+            if p.net_bps is not None
+        ]
+        assert counterfactual.net_bps == max(every_net)
+
+    def test_an_unpriceable_observation_yields_no_counterfactual(self):
+        from src.research.evaluate import best_priceable_decision
+
+        result = evaluate_observation(_obs(), COSTS, [Decimal("0")],
+                                      base_is_token0=True)
+        assert best_priceable_decision(result) is None
+
+    def test_the_counterfactual_resolves_through_the_same_latency_path(self):
+        """Same code, so the look-ahead guard applies identically: size and direction
+        are frozen at decision time."""
+        from src.research.evaluate import best_priceable_decision
+
+        result = evaluate_observation(
+            _obs(ts=0.0, cex=Decimal("1900"), dex=Decimal("1904")),
+            COSTS, NOTIONALS, base_is_token0=True,
+        )
+        counterfactual = best_priceable_decision(result)
+        forced = ObservationResult(
+            ts=result.ts, cex_symbol=result.cex_symbol, costs=result.costs,
+            curves=result.curves, best=counterfactual,
+        )
+        resolved = resolve_with_latency(
+            forced, [_obs(ts=2.0, cex=Decimal("1900"), dex=Decimal("1900"))],
+            delay_seconds=2.0, tolerance_seconds=0.5, base_is_token0=True,
+        )
+        assert resolved.realised_net_bps is not None
+        assert resolved.direction == counterfactual.direction
+        assert resolved.size_base == counterfactual.size_base

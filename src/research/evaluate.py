@@ -39,6 +39,7 @@ __all__ = [
     "ResolvedTrade",
     "evaluate_observation",
     "resolve_with_latency",
+    "best_priceable_decision",
 ]
 
 ZERO = Decimal("0")
@@ -225,6 +226,39 @@ def _best_decision(
         cex_price=point.cex_price,
         dex_price=point.dex_price,
         decided_at=observation.ts,
+    )
+
+
+def best_priceable_decision(result: ObservationResult) -> Optional[Decision]:
+    """The best trade at any PRICEABLE size, ignoring the floor.
+
+    A counterfactual, not a trade: "had you traded the best available size here, what
+    would it have been worth". It exists so the latency study has something to measure
+    on markets where nothing clears the floor -- which is every market in this
+    dataset. Without it, the cost of latency goes unmeasured for want of a qualifying
+    trade, and that cost is one of the two things the research exists to establish.
+
+    Callers must report which basis they used. A latency figure computed on
+    hypothetical trades is not the same statement as one computed on real ones.
+    """
+    best_point, best_direction = None, None
+    for direction, curve in result.curves.items():
+        for point in curve.curve:
+            if point.net_bps is None:
+                continue
+            if best_point is None or point.net_bps > best_point.net_bps:
+                best_point, best_direction = point, direction
+    if best_point is None:
+        return None
+    return Decision(
+        direction=best_direction,
+        size_base=best_point.size_base,
+        notional_quote=best_point.notional_quote,
+        net_bps=best_point.net_bps,
+        gross_bps=best_point.gross_bps,
+        cex_price=best_point.cex_price,
+        dex_price=best_point.dex_price,
+        decided_at=result.ts,
     )
 
 
