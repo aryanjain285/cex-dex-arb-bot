@@ -107,10 +107,16 @@ bridging basis (WBTC/USDT, −11.93 bps with every observation negative), and em
 pools reporting up to 3.9e52 bps because v3 keeps the price its creator set until
 someone trades.
 
-`research/FINDINGS.md` records all of it, including **four retractions** — results
+`research/FINDINGS.md` records all of it, including **five retractions** — results
 I believed and then disproved, kept in place with the measurement that overturned
-each. Three were timing artifacts; one was a single-hour result that two more hours
-contradicted.
+each. Four were measurement artifacts, three of them timing; one was a single-hour
+result that two more hours contradicted.
+
+Both sides of the trade were measured. The liquidity provider's markout on the same
+pool is **+0.64 bps equal-weighted with zero inside the interval**, and −1.95 bps
+volume-weighted — larger trades are more toxic, so quoting more size makes it worse.
+Before impermanent loss, which only subtracts. **The pool fee is not a margin
+available to either party; it is the price of the competition.**
 
 **Do not deploy capital against the current configuration.** What would change the
 answer is a cost above the pool fee near zero, which means maker orders at VIP8–9

@@ -144,7 +144,37 @@ fact about the test rather than about the market. The control now reports whethe
 power, and constancy is measured from the gap's own spread instead. Every stablecoin pair
 in the dataset classifies as a fixed offset; no volatile pair does.
 
-## 8. Retractions
+## 8. The other side of the same trade is also at break-even
+
+If the residual equals the pool fee, the arbitrageurs closing gaps are being paid that fee
+— and the payer is the liquidity provider. So the LP side needed one measurement.
+
+`flow_toxicity.py` — markout from the amounts in each Swap event, which are the pool's
+actual deltas with the fee included, valued at the exchange price for that second.
+WETH/USDC 0.05% Arbitrum, 340 trades over ~50 minutes:
+
+| | |
+| --- | --- |
+| informed flow (provider loses) | 42.6% of trades, 52.9% of volume |
+| uninformed flow (provider gains) | 57.4% of trades, 47.1% of volume |
+| median loss to informed | 8.00 bps |
+| median gain from uninformed | 8.89 bps |
+| **markout, equal-weighted** | **+0.64 bps**, se 0.90, 95% CI [−1.12, +2.40] |
+| **markout, volume-weighted** | **−1.95 bps** |
+
+Not distinguishable from zero equal-weighted, which is the expected result in a competitive
+market: the fee is exactly what arbitrage competes away, so the provider breaks even on
+trading and impermanent loss only subtracts from there.
+
+The gap between the weightings is the more interesting number. **Larger trades are more
+toxic** — informed traders size up, uninformed ones do not — so a provider cannot fix the
+problem by quoting more size. Textbook adverse selection, measured.
+
+So both sides of this trade sit at or below break-even. That is the symmetric form of §1
+and the strongest version of it: **the pool fee is not a margin available to either party,
+it is the price of the competition.**
+
+## 9. Retractions
 
 **A +0.703 correlation between volatility and dislocation, with 25 of 29 windows clearing
 the floor.** Block numbers were mapped to timestamps by interpolating between five anchors
@@ -170,10 +200,18 @@ holding about eleven independent draws. With 1,908 the same market flips sign 45
 time. Persistence is now a sign test on the effective sample rather than a flip-fraction
 threshold.
 
-All four came from asking what would produce the result if it were false. None came from
+**An LP edge of +4.74 bps of volume.** The first version of the flow measurement bracketed
+consecutive prints and asked how much of the gap each trade closed — which conflates the
+pool's move with the exchange's move over the interval between swaps, since consecutive
+swaps can be minutes apart. It reported a median gap closed of 0.16 bps against a gap
+*level* of 4.69. A number two orders of magnitude below the quantity it claims to measure
+is measuring something else. Using the markout from each event's own amounts gives
++0.64 bps equal-weighted, with zero inside the interval.
+
+All five came from asking what would produce the result if it were false. None came from
 something breaking.
 
-## 9. What would have to change
+## 10. What would have to change
 
 Not latency, not sizing, not fee tier, not universe breadth — each measured separately
 above.
