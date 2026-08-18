@@ -135,7 +135,16 @@ def main():
               f"{_f(control['noise_bound_bps'])} bps "
               f"(offset {control['offset_seconds']:.0f}s, "
               f"{control['identical_pairs']} identical pairs)")
-        if control["exceeds_noise"] is False:
+        if control.get("constant_offset"):
+            print("            FIXED OFFSET: the gap's own range is under a quarter of")
+            print("            its size, so it is a constant difference between the two")
+            print("            things compared -- a bridged representation, a different")
+            print("            asset, or a peg difference -- not a tradeable signal.")
+        elif control.get("control_has_power") is False:
+            print("            CONTROL HAS NO POWER on this pair: scrambling can only add")
+            print("            the venue's own movement, and this level barely moves over")
+            print("            the offset. Says nothing about the gap either way.")
+        elif control["exceeds_noise"] is False:
             print("            the real tail is NOT heavier than a time-scrambled "
                   "one: apparent edge at this level is indistinguishable from noise")
         elif control["exceeds_noise"] is True:

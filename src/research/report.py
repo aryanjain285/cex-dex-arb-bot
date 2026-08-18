@@ -694,6 +694,89 @@ def scrambled_control(
         # alone produces? If not, observations above that level prove nothing.
         exceeds = true_stats["p99"] > noise_bound
 
+    # TWO further diagnostics, and working out what scrambling actually does is what
+    # separates them. The scrambled dislocation is
+    #
+    #     pool(t') - cex(t)  =  [pool(t') - cex(t')]  +  [cex(t') - cex(t)]
+    #                        =  the true gap at t'    +  the venue's own move
+    #
+    # so scrambling always ADDS the variance of the underlying price's movement over the
+    # offset. It never removes anything. Which means:
+    #
+    #   the level moves a lot relative to the gap  ->  scrambled >> true, and the
+    #       control discriminates. ETH/USDC: true p99 0.07 bps against a scrambled 9.70.
+    #
+    #   the level barely moves relative to the gap ->  scrambled ~= true, and the
+    #       control CANNOT discriminate, because there was nothing for scrambling to
+    #       disturb. USDC/USDT on Base: true p99 8.77 against a scrambled 8.77.
+    #
+    # I first read that second case as proof of a constant offset. It is not proof of
+    # anything about the gap -- it is a statement about the control's power on that pair.
+    # Constancy has to be judged from the TRUE distribution's own spread instead, which
+    # is a direct measurement rather than an inference.
+    control_has_power = None
+    if (
+        true_stats.get("sd") is not None
+        and scrambled_stats.get("sd") is not None
+        and true_stats.get("p50") is not None
+    ):
+        true_sd = true_stats["sd"]
+        scrambled_sd = scrambled_stats["sd"]
+        # Measured against the SIZE OF THE GAP, not against the true spread. Comparing to
+        # the true spread is useless when that spread is near zero, which is exactly the
+        # case of interest: any added variance then looks like power. What matters is
+        # whether scrambling adds enough noise to have changed the verdict about a gap of
+        # this size.
+        gap = abs(true_stats["p50"])
+        control_has_power = scrambled_sd > max(0.25 * gap, 1e-9)
+        if not control_has_power and reason is None:
+            reason = (
+                f"the control cannot discriminate here: scrambling by "
+                f"{offset_seconds:.0f}s added only {scrambled_sd:.2f} bps of spread "
+                f"against a gap of {gap:.2f} bps, because the underlying price barely "
+                f"moves over that interval. Scrambling can only ADD the venue's own "
+                f"movement, so on a nearly static level there is nothing to disturb. That "
+                f"does rule out a timing artifact -- the gap is not mismatch -- but it "
+                f"cannot separate a tradeable dislocation from a fixed offset. Judge that "
+                f"from the gap's own spread."
+            )
+
+    # Constancy, measured directly: how wide is the true distribution relative to where
+    # it sits? USDC/USDT on Base ran p1 +9.23 to p99 +9.83 over two hours -- a 0.6 bps
+    # range around a 9.4 bps median, which is a fixed offset rather than a market gap.
+    # It was the only positive net edge in the dataset and the largest raw dislocation on
+    # any liquid pair, so naming it matters.
+    constant_offset = None
+    p1, p99, median = (
+        true_stats.get("p1"), true_stats.get("p99"), true_stats.get("p50")
+    )
+    # At least 30 observations. A single reading has p1 == p99 == median by definition,
+    # so without a floor every one-row sample would be declared a fixed offset -- the
+    # strongest possible conclusion from the weakest possible evidence, which is the same
+    # mistake the persistence classifier made before it was given a floor.
+    if (
+        None not in (p1, p99, median)
+        and abs(median) > 1e-9
+        and (true_stats.get("n") or 0) >= 30
+    ):
+        # BOTH conditions. A relative test alone over-fires on markets whose gap is huge
+        # for an unrelated reason: ARB/USDT 0.05% shows a median of -135 bps because the
+        # pool is nearly empty and the "gap" is mostly price impact, and its range is
+        # narrow relative to that, so the relative test alone called it a fixed offset.
+        # A genuine offset -- a bridged representation, a peg difference -- is narrow in
+        # ABSOLUTE terms too, because it is a real price for a real thing.
+        span = p99 - p1
+        constant_offset = span < 3.0 and span / abs(median) < 0.25
+        if constant_offset and reason is None:
+            reason = (
+                f"the gap runs {p1:.2f} to {p99:.2f} bps around a median of "
+                f"{median:.2f} -- a range of {span:.2f} bps, under a quarter of its "
+                f"own size. That is a FIXED OFFSET between the two things being compared, "
+                f"not a market gap: a bridged representation, a different asset, or a "
+                f"persistent peg difference. Capturing it once moves inventory; capturing "
+                f"it again requires putting the inventory back."
+            )
+
     return {
         "true": true_stats,
         "scrambled": scrambled_stats,
@@ -703,6 +786,8 @@ def scrambled_control(
         # The level below which an apparent edge is indistinguishable from noise.
         "noise_bound_bps": noise_bound,
         "exceeds_noise": exceeds,
+        "constant_offset": constant_offset,
+        "control_has_power": control_has_power,
         "reason": reason,
     }
 
