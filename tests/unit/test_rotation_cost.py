@@ -33,7 +33,7 @@ def test_rotation_cost_is_the_fee_divided_by_trades_it_supports():
     """A $4 withdrawal that funds 5 trades costs $0.80 per trade."""
     cost = amortised_rotation_cost(
         withdrawal_fee_quote=D(4), bridge_gas_quote=D(0),
-        float_quote=D(5000), notional_quote=D(1000), transfer_risk_bps=D(0),
+        float_quote=D(5000), notional_quote=D(1000),
     )
     assert cost == D("0.8")
 
@@ -41,29 +41,42 @@ def test_rotation_cost_is_the_fee_divided_by_trades_it_supports():
 def test_bridge_gas_is_included_in_the_rotation():
     cost = amortised_rotation_cost(
         withdrawal_fee_quote=D(4), bridge_gas_quote=D(1),
-        float_quote=D(5000), notional_quote=D(1000), transfer_risk_bps=D(0),
+        float_quote=D(5000), notional_quote=D(1000),
     )
     assert cost == D(1), "(4 + 1) / 5 trades"
 
 
-def test_transfer_price_risk_is_charged_on_the_moved_notional():
-    """Inventory in transit is unhedged. A 50 bps expected adverse move on the
-    rotated float, amortised the same way, is a real cost of doing business."""
+def test_transfer_risk_is_no_longer_charged_as_a_cost():
+    """The correction. Exposure while inventory is in transit is variance, not a
+    negative mean -- E[dP] = 0 under zero drift -- and subtracting it made every
+    recorded net_bps not the expected value of anything.
+
+    It is still charged, as a threshold: see rotation_risk_bps and
+    required_net_bps in test_rotation_risk_separation.py.
+    """
+    from src.strategy.costs import rotation_risk_bps, required_net_bps
+
     cost = amortised_rotation_cost(
-        withdrawal_fee_quote=D(0), bridge_gas_quote=D(0),
-        float_quote=D(5000), notional_quote=D(1000), transfer_risk_bps=D(50),
+        withdrawal_fee_quote=D(4), bridge_gas_quote=D(1),
+        float_quote=D(5000), notional_quote=D(1000),
     )
-    # 5000 * 50/10000 = 25 of risk, over 5 trades = 5 per trade
-    assert cost == D(5)
+    # Fees only: 5 dollars over 5 trades.
+    assert cost == D(1)
+
+    # And the exposure raises the bar instead of lowering the measurement.
+    charge = rotation_risk_bps(
+        float_quote=D(5000), notional_quote=D(1000), transfer_risk_bps=D(10))
+    assert charge == D(10)
+    assert required_net_bps(base_floor_bps=D(5), risk_charge_bps=charge) == D(15)
 
 
 def test_a_larger_float_amortises_the_fee_further():
     small = amortised_rotation_cost(
         withdrawal_fee_quote=D(4), bridge_gas_quote=D(0),
-        float_quote=D(2000), notional_quote=D(1000), transfer_risk_bps=D(0))
+        float_quote=D(2000), notional_quote=D(1000))
     large = amortised_rotation_cost(
         withdrawal_fee_quote=D(4), bridge_gas_quote=D(0),
-        float_quote=D(20000), notional_quote=D(1000), transfer_risk_bps=D(0))
+        float_quote=D(20000), notional_quote=D(1000))
     assert small > large
     assert small == D(2) and large == D("0.2")
 
@@ -74,22 +87,30 @@ def test_a_float_smaller_than_one_trade_is_rejected():
     with pytest.raises(ValueError):
         amortised_rotation_cost(
             withdrawal_fee_quote=D(4), bridge_gas_quote=D(0),
-            float_quote=D(500), notional_quote=D(1000), transfer_risk_bps=D(0))
+            float_quote=D(500), notional_quote=D(1000))
 
 
 @pytest.mark.parametrize("bad", [
     {"withdrawal_fee_quote": Decimal("-1")},
     {"bridge_gas_quote": Decimal("-1")},
-    {"transfer_risk_bps": Decimal("-1")},
     {"notional_quote": Decimal("0")},
 ])
 def test_invalid_rotation_inputs_are_rejected(bad):
     args = dict(withdrawal_fee_quote=D(4), bridge_gas_quote=D(0),
-                float_quote=D(5000), notional_quote=D(1000),
-                transfer_risk_bps=D(0))
+                float_quote=D(5000), notional_quote=D(1000))
     args.update(bad)
     with pytest.raises(ValueError):
         amortised_rotation_cost(**args)
+
+
+def test_a_negative_transfer_risk_is_rejected_by_the_risk_function():
+    """The validation moved with the parameter. A negative risk charge would LOWER
+    the required edge, which is not a policy anyone means to express."""
+    from src.strategy.costs import rotation_risk_bps
+
+    with pytest.raises(ValueError):
+        rotation_risk_bps(float_quote=D(5000), notional_quote=D(1000),
+                          transfer_risk_bps=D(-1))
 
 
 # --------------------------------------------------------------------------

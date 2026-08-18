@@ -537,7 +537,6 @@ def survey(
             bridge_gas_quote=Decimal(str(config.strategy.rotation.bridge_gas_quote)),
             float_quote=Decimal(str(config.strategy.rotation.float_quote)),
             notional_quote=notional,
-            transfer_risk_bps=Decimal(str(config.strategy.rotation.transfer_risk_bps)),
         )
         if config.strategy.rotation.enabled else Decimal(0)
     )

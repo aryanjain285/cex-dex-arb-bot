@@ -41,6 +41,8 @@ from src.exchange.errors import RpcError
 from src.exchange.pool_selector import PoolSelector
 from src.strategy.placebo import DelayedQuoteBuffer
 from src.strategy.costs import (
+    required_net_bps,
+    rotation_risk_bps,
     BookFill,
     TradeEconomics,
     amortised_rotation_cost,
@@ -122,6 +124,8 @@ class OpportunityDetector:
         self.store = store
         self._intermediate_price_cache: Dict[str, Tuple[Tuple[Decimal, Decimal], float]] = {}
         self._rotation_cost_quote = self._compute_rotation_cost()
+        # A threshold, not a cost. See _compute_rotation_risk_bps.
+        self._rotation_risk_bps = self._compute_rotation_risk_bps()
         placebo_cfg = strategy_config.placebo
         self._placebo = (
             DelayedQuoteBuffer(placebo_cfg.delay_seconds)
@@ -167,6 +171,22 @@ class OpportunityDetector:
         return amortised_rotation_cost(
             withdrawal_fee_quote=Decimal(str(rotation.withdrawal_fee_quote)),
             bridge_gas_quote=Decimal(str(rotation.bridge_gas_quote)),
+            float_quote=Decimal(str(rotation.float_quote)),
+            notional_quote=Decimal(str(self.strategy_config.target_notional_usd)),
+        )
+
+    def _compute_rotation_risk_bps(self) -> Decimal:
+        """Risk charge for unhedged inventory in transit, as a floor adjustment.
+
+        Deliberately NOT subtracted from the measured edge. Inventory exposure while
+        in transit is variance, not a negative mean -- E[dP] = 0 under zero drift --
+        and the previous model subtracted it as an expense, which made every
+        recorded net_bps not the expected value of anything.
+        """
+        rotation = self.strategy_config.rotation
+        if not rotation.enabled:
+            return ZERO
+        return rotation_risk_bps(
             float_quote=Decimal(str(rotation.float_quote)),
             notional_quote=Decimal(str(self.strategy_config.target_notional_usd)),
             transfer_risk_bps=Decimal(str(rotation.transfer_risk_bps)),
@@ -332,16 +352,54 @@ class OpportunityDetector:
             return pair
         return pair.model_copy(update={"dex_pool_fee": fee})
 
+    async def _both_directions(self, pair: MarketPair, *coros) -> List[_Evaluation]:
+        """Evaluate both directions concurrently, isolating each one's failures.
+
+        Two defects in one line. The old form was:
+
+            return [await self._eval_cex_to_dex(...), await self._eval_dex_to_cex(...)]
+
+        Those awaits are SEQUENTIAL, so with a measured 0.31-0.83s median RPC
+        latency plus a gas call each, the two directions sampled the pool up to a
+        second apart -- and `_decide` then picked "the better direction" from two
+        observations that were never simultaneous. On a moving pool that comparison
+        is partly a coin flip on which direction was measured first. The CEX side
+        was already consistent: one book snapshot is taken and shared.
+
+        And a raising direction took the whole pair down: the exception propagated
+        to `detect`, which recorded a single pair-level ERROR and discarded the
+        other direction's perfectly good evaluation.
+
+        `return_exceptions=True` fixes the second while gather fixes the first. A
+        failed direction becomes its own ERROR record, so the dataset distinguishes
+        "this direction failed" from "this pair failed".
+        """
+        results = await asyncio.gather(*coros, return_exceptions=True)
+        evaluations: List[_Evaluation] = []
+        for direction, result in zip(("CEX_to_DEX", "DEX_to_CEX"), results):
+            if isinstance(result, BaseException):
+                logger.warning(
+                    f"{pair.cex_symbol} {direction} failed: "
+                    f"{type(result).__name__}: {result}"
+                )
+                evaluations.append(
+                    _Evaluation(direction=direction, reason=RejectionReason.ERROR)
+                )
+            else:
+                evaluations.append(result)
+        return evaluations
+
     async def _evaluate_direct(self, pair: MarketPair) -> List[_Evaluation]:
         book, reason = await self._usable_book(pair)
         if book is None:
             return [_Evaluation(direction="", reason=reason)]
 
         notional = Decimal(str(self.strategy_config.target_notional_usd))
-        return [
-            await self._eval_cex_to_dex(pair, book, notional, cex_legs=1),
-            await self._eval_dex_to_cex(pair, book, notional, cex_legs=1),
-        ]
+        return await self._both_directions(
+            pair,
+            self._eval_cex_to_dex(pair, book, notional, cex_legs=1),
+            self._eval_dex_to_cex(pair, book, notional, cex_legs=1),
+        )
 
     async def _eval_cex_to_dex(
         self,
@@ -538,20 +596,21 @@ class OpportunityDetector:
         intermediate_ask, intermediate_bid = prices
 
         notional = Decimal(str(self.strategy_config.target_notional_usd))
-        return [
+        return await self._both_directions(
+            pair,
             # Selling base on the DEX yields the intermediate asset, which is
             # then sold on the CEX -- convert at the intermediate *bid*.
-            await self._eval_cex_to_dex(
+            self._eval_cex_to_dex(
                 pair, book, notional, cex_legs=2, dex_price_scale=intermediate_bid
             ),
             # Buying base on the DEX spends the intermediate asset, which must
             # first be bought on the CEX -- convert at the intermediate *ask*.
-            await self._eval_dex_to_cex(
+            self._eval_dex_to_cex(
                 pair, book, notional, cex_legs=2,
                 dex_price_scale=intermediate_ask,
                 dex_spend=notional / intermediate_ask,
             ),
-        ]
+        )
 
     # ------------------------------------------------------------------
     # decision + recording
@@ -621,10 +680,25 @@ class OpportunityDetector:
         return econ.net_bps if econ is not None else None
 
     def _floor_for(self, pair: MarketPair) -> Decimal:
-        return (
+        """The edge this pair must clear: its base floor plus the risk charge.
+
+        The risk charge is here rather than inside the economics on purpose. Unhedged
+        inventory in transit is variance, not a negative mean, so subtracting it from
+        the measured edge -- which is what the old rotation model did -- made every
+        recorded net_bps not the expected value of anything, and silently rewrote
+        history's edges whenever the risk assumption changed.
+
+        Both numbers are recorded: `min_net_bps` on each row is this combined floor,
+        and `net_bps` is the honest expected edge. A later reader can re-decide the
+        same rows under a different risk policy without re-measuring anything.
+        """
+        base = (
             Decimal(pair.min_net_bps)
             if pair.min_net_bps is not None
             else self.strategy_config.min_net_bps
+        )
+        return required_net_bps(
+            base_floor_bps=base, risk_charge_bps=self._rotation_risk_bps
         )
 
     def _decide(

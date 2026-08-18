@@ -49,7 +49,15 @@ async def test_rotation_cost_is_recorded_in_the_audit_trail():
     assert priced, "rotation cost must be persisted"
     assert priced[0].rotation_cost_quote > 0
     # (4 + 1 + 5000*10/1e4) / 5 = (5 + 5)/5 = 2
-    assert priced[0].rotation_cost_quote == D(2)
+    # $4 withdrawal + $1 bridge gas over 5 trades = $1.00. It was $2.00 while the
+    # model also subtracted 10 bps of transfer risk on the float as though variance
+    # were a negative mean -- that half is now a floor adjustment, not a cost.
+    assert priced[0].rotation_cost_quote == D(1)
+    # And the exposure it used to double as is visible on the floor instead.
+    assert priced[0].min_net_bps == D(11), (
+        f"expected the 1 bps base plus a 10 bps risk charge, got "
+        f"{priced[0].min_net_bps}"
+    )
 
 
 def test_a_float_too_small_for_the_notional_fails_at_config_load():

@@ -85,7 +85,15 @@ async def test_a_near_miss_is_recorded_with_its_edge_and_reason():
     below = [r for r in rec.records if r.reason == RejectionReason.BELOW_FLOOR]
     assert below, f"expected a below_floor record, got {[r.reason for r in rec.records]}"
     assert below[0].net_bps is not None, "the near-miss edge must be recorded"
-    assert below[0].min_net_bps == D(50), "the floor in force must be recorded"
+    # The recorded floor is the COMBINED floor: the configured base plus the
+    # rotation risk charge. That is the number the decision was actually made
+    # against, and recording the base alone would make the row unreproducible --
+    # a reader could not tell why a +55 bps edge had been refused.
+    #
+    # 50 configured + 10 bps of transfer risk on this fixture's rotation config.
+    assert below[0].min_net_bps == D(60), (
+        f"expected the combined floor, got {below[0].min_net_bps}"
+    )
 
 
 async def test_rejection_reasons_are_specific_not_generic():

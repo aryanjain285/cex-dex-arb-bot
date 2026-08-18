@@ -104,38 +104,47 @@ def amortised_rotation_cost(
     bridge_gas_quote: Decimal,
     float_quote: Decimal,
     notional_quote: Decimal,
-    transfer_risk_bps: Decimal,
 ) -> Decimal:
-    """Per-trade share of the cost of moving inventory between venues.
+    """Per-trade share of the FEES paid to move inventory between venues.
 
-    A CEX<->DEX arb is an inventory rotation, not a round trip. `CEX_to_DEX`
-    buys base on the exchange and sells base from the on-chain wallet: two
-    different assets in two custody locations. Trading again requires physically
-    moving inventory back, which is not free and is not instantaneous.
+    A CEX<->DEX arb is an inventory rotation, not a round trip. `CEX_to_DEX` buys
+    base on the exchange and sells base from the on-chain wallet: two different
+    assets in two custody locations. Trading repeatedly in one direction requires
+    physically moving inventory back, which costs money.
 
-    Three costs make up a rotation:
+    Two costs, both of which genuinely leave the account:
 
     - `withdrawal_fee_quote`: what the exchange charges to withdraw.
     - `bridge_gas_quote`: on-chain cost of the transfer or bridge.
-    - `transfer_risk_bps`: expected adverse price move on the in-transit float,
-      which is unhedged for the duration. Charged on `float_quote`, because the
-      whole float is exposed, not just one trade's notional.
 
-    The total is amortised over `float_quote / notional_quote` trades -- how
-    many trades the float supports before a rotation becomes necessary. A
-    larger float amortises the fixed fees further; it does not reduce the
-    transfer risk per trade, because a larger float has more at risk.
+    Amortised over `float_quote / notional_quote` trades -- how many trades the
+    float supports before a rotation is needed. A larger float amortises further.
 
-    Worked: a $4 withdrawal funding a $5,000 float at $1,000 notional supports
-    5 trades, so the fee contributes $0.80/trade. Against an expected $0.50 at
-    a 5 bps floor, that alone is negative-EV -- which is the point.
+    WHAT IS NO LONGER HERE, AND WHY
+
+    This function also charged `float_quote * transfer_risk_bps / 10000` and called
+    it, in its own docstring, the "expected adverse price move on the in-transit
+    float". That is the error stated out loud: under a zero-drift assumption
+
+        E[dP] = 0        while       Var(dP) > 0
+
+    Exposure while inventory is in transit is variance, not a negative mean.
+    Subtracting it made `net_bps` -- the number recorded on every row of the audit
+    trail -- not the expected value of anything, and depressed every measured edge
+    by the full `transfer_risk_bps`.
+
+    Worse, it corrupted the measurement rather than the decision: changing the risk
+    assumption silently rewrote what history's edges had "been". The exposure is
+    real and still charged, as a threshold: see `rotation_risk_bps` and
+    `required_net_bps`. Measurement stays honest; risk appetite moves to the floor.
+
+    Worked: a $4 withdrawal plus $1 bridge gas funding a $5,000 float at $1,000
+    notional supports 5 trades, so fees contribute $1.00/trade -- 10 bps.
     """
     if withdrawal_fee_quote < ZERO:
         raise ValueError("withdrawal_fee_quote must be non-negative")
     if bridge_gas_quote < ZERO:
         raise ValueError("bridge_gas_quote must be non-negative")
-    if transfer_risk_bps < ZERO:
-        raise ValueError("transfer_risk_bps must be non-negative")
     if notional_quote <= ZERO:
         raise ValueError("notional_quote must be positive")
     if float_quote < notional_quote:
@@ -145,9 +154,64 @@ def amortised_rotation_cost(
         )
 
     trades_per_rotation = float_quote / notional_quote
-    transfer_risk_quote = float_quote * transfer_risk_bps / TEN_THOUSAND
-    total = withdrawal_fee_quote + bridge_gas_quote + transfer_risk_quote
-    return total / trades_per_rotation
+    return (withdrawal_fee_quote + bridge_gas_quote) / trades_per_rotation
+
+
+def rotation_risk_bps(
+    *,
+    float_quote: Decimal,
+    notional_quote: Decimal,
+    transfer_risk_bps: Decimal,
+) -> Decimal:
+    """Per-trade risk charge for unhedged inventory in transit, in basis points.
+
+    This is deliberately NOT a cost. It raises the edge a trade must clear rather
+    than reducing the edge it is measured to have -- so `net_bps` remains an
+    expected value and stays comparable across changes in risk policy.
+
+    Note what falls out of the arithmetic: the exposure is on the whole float but
+    is incurred once per rotation, and a rotation covers `float / notional` trades.
+    Per trade that is exactly `transfer_risk_bps`, independent of float size. The
+    old form multiplied by the float AND divided by trades-per-rotation, so the
+    float cancelled anyway -- the scaling was decorative.
+
+    Proper treatment of the variance -- required Sharpe, expected shortfall, a
+    capital charge, or hedging the exposure with a perp instead of transferring --
+    is a portfolio question this function does not attempt. It only makes the
+    threshold reflect that the risk exists.
+    """
+    if transfer_risk_bps < ZERO:
+        raise ValueError("transfer_risk_bps must be non-negative")
+    if notional_quote <= ZERO:
+        raise ValueError("notional_quote must be positive")
+    if float_quote < notional_quote:
+        raise ValueError(
+            f"float_quote ({float_quote}) is smaller than one trade's notional "
+            f"({notional_quote})"
+        )
+    return transfer_risk_bps
+
+
+def required_net_bps(
+    *,
+    base_floor_bps: Decimal,
+    risk_charge_bps: Decimal,
+) -> Decimal:
+    """The edge a trade must clear: the configured floor plus the risk charge.
+
+    Keeping these separate is what lets the audit trail record both an honest
+    expected edge and the threshold it was judged against, so a later reader can
+    re-decide the same rows under a different risk policy without re-measuring.
+    """
+    if base_floor_bps < ZERO:
+        raise ValueError("base_floor_bps must be non-negative")
+    if risk_charge_bps < ZERO:
+        raise ValueError(
+            f"risk_charge_bps must be non-negative, got {risk_charge_bps}. A "
+            f"negative charge would LOWER the required edge, which is not a risk "
+            f"policy anyone means to express."
+        )
+    return base_floor_bps + risk_charge_bps
 
 
 @dataclass(frozen=True)

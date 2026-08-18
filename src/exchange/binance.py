@@ -24,6 +24,9 @@ from .cex_base import CexClient, CexOrder, OrderUpdate
 _BINANCE_ORDER_STATUS = {
     "NEW": "new",
     "PENDING_NEW": "new",
+    # Sent only on the user-data stream, and previously absent from its private
+    # map -- so each of these fell through to a "partially_filled" default.
+    "PARTIAL_FILL": "partially_filled",
     "PARTIALLY_FILLED": "partially_filled",
     "FILLED": "filled",
     "CANCELED": "canceled",
@@ -264,40 +267,64 @@ class BinanceCexClient(CexClient):
                     await asyncio.sleep(5)
 
     async def _process_execution_report(self, event: dict) -> None:
+        """Handle one asynchronous executionReport.
+
+        This is how a fill that happens after the REST response is learned about at
+        all, so it is the path reconciliation depends on. It previously carried its
+        OWN status map -- which is why `create_order` was fixed and this was not --
+        plus two worse defects:
+
+        `filled_size` came from event['l'], the LAST fill quantity, while
+        event['z'] (cumulative) was computed on the line above and then unused. A
+        partial sequence of 0.2, 0.3, 0.5 reported 0.5 rather than 1.0, so a hedge
+        sized from it left the difference unhedged and the bot did not know.
+
+        `avg_fill_price` defaulted to Decimal('0'), so an event carrying no price
+        reported a fill price of zero -- a number that flows into PnL and values
+        the position at nothing.
+
+        Both paths now share `_translate_order_status`, so they cannot drift again.
+        """
         order_id = str(event.get('i'))
-        status_raw = str(event.get('X', '')).lower()
-        status_map = {
-            "new": "partially_filled",
-            "partially_filled": "partially_filled",
-            "partial_fill": "partially_filled",
-            "filled": "filled",
-            "canceled": "canceled",
-            "expired": "canceled",
-            "rejected": "rejected",
-        }
-        status = status_map.get(status_raw, "partially_filled")
+        status, reason_note = _translate_order_status(str(event.get('X', '')).upper())
 
         last_filled = Decimal(str(event.get('l', '0')))
         cumulative_filled = Decimal(str(event.get('z', '0')))
         cumulative_quote = Decimal(str(event.get('Z', '0')))
 
-        avg_fill_price = Decimal('0')
+        # Cumulative, not the last fill: this is the quantity actually held.
+        filled_size = cumulative_filled
+
+        avg_fill_price = None
         if cumulative_filled > 0 and cumulative_quote > 0:
             avg_fill_price = cumulative_quote / cumulative_filled
         elif last_filled > 0:
-            avg_fill_price = Decimal(str(event.get('L', '0')))
+            # Some events carry the last price without a cumulative quote. Better
+            # than nothing, and far better than zero.
+            last_price = Decimal(str(event.get('L', '0')))
+            avg_fill_price = last_price if last_price > 0 else None
 
         reason = event.get('r')
         if reason and reason.upper() == 'NONE':
             reason = None
+        # An unrecognised status carries its own explanation; keep both.
+        if reason_note:
+            reason = f"{reason_note}" if not reason else f"{reason}; {reason_note}"
 
-        ts_ms = event.get('E') or event.get('T') or int(time.time() * 1000)
-        ts = float(ts_ms) / 1000 if ts_ms else time.time()
+        if status == "unknown":
+            logger.error(
+                f"Unrecognised executionReport status {event.get('X')!r} for order "
+                f"{order_id}. Treating the state as indeterminate rather than as a "
+                f"fill; reconcile before trading this pair again."
+            )
+
+        ts_ms = event.get('E') or event.get('T') or clock.now_ms()
+        ts = float(ts_ms) / 1000
 
         update = OrderUpdate(
             order_id=order_id,
             status=status,
-            filled_size=last_filled,
+            filled_size=filled_size,
             avg_fill_price=avg_fill_price,
             reason=reason,
             ts=ts,

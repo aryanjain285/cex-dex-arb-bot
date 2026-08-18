@@ -108,5 +108,8 @@ async def test_rejection_reasons_are_queryable(store):
     reasons = {r["reason"] for r in rows}
     assert RejectionReason.BELOW_FLOOR in reasons
     below = [r for r in rows if r["reason"] == RejectionReason.BELOW_FLOOR]
-    assert Decimal(below[0]["min_net_bps"]) == D(50)
+    # The COMBINED floor: 50 configured plus the rotation risk charge. Recording
+    # the base alone would leave a reader unable to explain why a +55 bps edge was
+    # refused.
+    assert Decimal(below[0]["min_net_bps"]) == D(60)
     assert below[0]["net_bps"] is not None
