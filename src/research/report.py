@@ -508,12 +508,42 @@ def format_report(report: MarketReport) -> str:
     else:
         lines.append(f"              no interval: {gi.get('reason')}")
 
-    net = report.net_bps
+    net, ni = report.net_bps, report.net_interval
     lines.append(
         f"  net bps     mean {_fmt(net.get('mean'))}  "
         f"median {_fmt(net.get('p50'))}  p90 {_fmt(net.get('p90'))}  "
         f"max {_fmt(net.get('max'))}"
     )
+    # The statistically rigorous form of the conclusion, stated rather than left to be
+    # eyeballed from a mean. A negative mean is not a result; a negative mean whose
+    # interval excludes zero is. Both directions are reported, because "we cannot rule
+    # out a positive edge" is a completely different finding from "the edge is
+    # negative", and only the interval separates them.
+    if ni.get("lower") is not None:
+        lines.append(
+            f"              95% CI [{_fmt(ni['lower'])}, {_fmt(ni['upper'])}]  "
+            f"effective n {ni['effective_n']:,} of {ni['n']:,}"
+        )
+        if ni["upper"] < 0:
+            lines.append(
+                f"              VERDICT: the whole interval is below zero, so a "
+                f"positive net edge at the best size on this grid is excluded at 95% "
+                f"confidence -- allowing for autocorrelation."
+            )
+        elif ni["lower"] > 0:
+            lines.append(
+                f"              VERDICT: the whole interval is ABOVE zero. Check the "
+                f"negative control and the barrier flag before acting on this."
+            )
+        else:
+            lines.append(
+                f"              VERDICT: the interval spans zero. Neither a positive "
+                f"nor a negative net edge is established; more observations are "
+                f"needed, and note that effective n is what governs that, not the "
+                f"raw count."
+            )
+    elif ni.get("reason"):
+        lines.append(f"              no net interval: {ni['reason']}")
     exceed = "  ".join(
         f">{int(t)}: {('-' if v is None else f'{v:.4%}')}"
         for t, v in sorted(report.exceedance_net.items())
