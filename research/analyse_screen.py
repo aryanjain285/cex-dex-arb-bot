@@ -34,7 +34,11 @@ from pathlib import Path
 from research_config import research_config
 
 from src.exchange.univ3_math import notional_to_move_price
-from src.research.observations import ObservationStore, mid_dislocation_bps
+from src.research.observations import (
+    ObservationStore,
+    mid_dislocation_bps,
+    plausible_same_asset,
+)
 from src.research.report import classify_dislocation, group_key
 from src.research.statistics import describe
 
@@ -71,6 +75,7 @@ def main():
     dislocations = defaultdict(list)
     depths = defaultdict(list)
     no_liquidity = defaultdict(int)
+    collisions = {}
     for observation in store.read_all():
         key = group_key(observation)
         target = targets.get(key)
@@ -83,8 +88,23 @@ def main():
         if value is None:
             no_liquidity[key] += 1
             continue
+        pool_price = observation.pool.spot_price()
+        if not base_is_token0 and pool_price and pool_price > 0:
+            pool_price = Decimal(1) / pool_price
+        if not plausible_same_asset(pool_price, observation.cex_mid):
+            collisions[key] = (pool_price, observation.cex_mid)
+            continue
         dislocations[key].append(value)
         depths[key].append(notional_to_move_price(observation.pool, Decimal("0.01")))
+
+    if collisions:
+        print()
+        print(f"{len(collisions)} markets excluded: the pool and exchange prices "
+              f"cannot be the same asset")
+        for key, (pool_price, cex_price) in sorted(collisions.items())[:10]:
+            ratio = (pool_price / cex_price) if cex_price else None
+            print(f"  {key[0]:<14} {key[1]:<9} {key[2]:>5}  "
+                  f"{float(ratio):>10.2f}x  -- a ticker collision, not a dislocation")
 
     dead = [k for k in targets if k in no_liquidity and k not in dislocations]
     print(f"\n{len(dislocations)} markets with a tradeable price, "

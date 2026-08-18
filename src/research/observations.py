@@ -47,7 +47,7 @@ from ..exchange.pool_state import PoolSnapshot
 
 __all__ = [
     "Observation", "ObservationStore", "SCHEMA_VERSION",
-    "mid_dislocation_bps",
+    "mid_dislocation_bps", "plausible_same_asset", "DEFAULT_MAX_PRICE_RATIO",
 ]
 
 # Bumped when the meaning of a column changes. Additive columns do not need it;
@@ -442,3 +442,54 @@ def mid_dislocation_bps(
     # 36-billion-bps reading in the optimiser before it was made explicit.
     pool_price = spot if base_is_token0 else (Decimal(1) / spot)
     return (pool_price - mid) / mid * Decimal(10000)
+
+# How far two venues quoting the SAME asset may disagree before the disagreement is
+# better explained by their quoting different assets. Deliberately loose: a genuine
+# 100% CEX-DEX gap on a liquid asset does not happen, and if it did the right first
+# response would still be to disbelieve the data.
+DEFAULT_MAX_PRICE_RATIO = Decimal("2")
+
+
+def plausible_same_asset(
+    pool_price: Optional[Decimal],
+    cex_price: Optional[Decimal],
+    max_ratio: Decimal = DEFAULT_MAX_PRICE_RATIO,
+) -> bool:
+    """Could these two prices be the same asset on two venues?
+
+    The last identity guard, and the only one that works on the failure the others
+    cannot see. The expansion pipeline already requires that CoinGecko list exactly one
+    token with a ticker on the chain, and that the contract's own symbol() match the
+    exchange's ticker. Both passed for MET, and MET is a different asset:
+
+        MET/WETH on Ethereum, pool 0xCEb5c29bdE4604296135DD7b027A433fD3633516
+          pool     0.0007468546 WETH per MET
+          Binance  0.0000848547 WETH per MET
+          ratio    8.80x        -> reported as +78,008 bps, the largest apparent
+                                   opportunity in the entire dataset
+
+The token at 0x2Ebd53d0...89aa is genuinely called MET on chain and Binance
+    genuinely lists a MET. They are different projects, and no symbol comparison can
+    separate them because both symbols are right.
+
+    Price can. Two venues quoting the same asset agree to within a few percent always --
+    that is what arbitrage means, and this strategy's entire premise is that they agree
+    to within basis points. A ratio of 8.8 is therefore not a dislocation to rank; it is
+    proof the two sides quote different things.
+
+    Note what this does NOT judge: whether a gap is harvestable. BNB showed 1.0456x,
+    which is implausible as an arbitrage and entirely plausible as a price -- a legacy
+    ERC-20 with no withdrawal path from the exchange. That is a settlement question and
+    belongs to the token policy, not here.
+    """
+    if max_ratio <= 1:
+        raise ValueError(
+            f"max_ratio must exceed 1, got {max_ratio}; a band at or below 1 rejects "
+            f"every pair of prices including identical ones"
+        )
+    if pool_price is None or cex_price is None:
+        return False
+    if pool_price <= 0 or cex_price <= 0:
+        return False
+    ratio = pool_price / cex_price
+    return (Decimal(1) / max_ratio) <= ratio <= max_ratio

@@ -464,7 +464,16 @@ def format_report(report: MarketReport) -> str:
             )
         )
         kind = report.basis_kind.get("kind")
-        if kind == "standing_basis":
+        if kind == "standing_basis" and report.basis_kind.get("barrier_suspected"):
+            lines.append(
+                f"              BARRIER SUSPECTED, not an opportunity: a "
+                f"{abs(report.basis_kind['median_bps']):.0f} bps gap that never "
+                f"changes sign on a pool with real liquidity. If it were "
+                f"arbitrageable it would not persist -- someone faster would have "
+                f"taken it. Find the barrier (settlement path, wrapped or legacy "
+                f"representation, withdrawal network) before believing the number."
+            )
+        elif kind == "standing_basis":
             lines.append(
                 f"              STANDING BASIS: the sign flips in only "
                 f"{report.basis_kind['sign_flip_fraction']:.1%} of observations. "
@@ -734,8 +743,18 @@ BASIS_FLIP_THRESHOLD = 0.05
 # strongest available conclusion from the weakest available sample.
 MIN_OBSERVATIONS_TO_CLASSIFY = 20
 
+# A standing gap at least this large is treated as evidence of a barrier rather than of
+# an opportunity. 100 bps is chosen to be well beyond anything competitive arbitrage
+# leaves on the table: a persistent 1% gap on an asset that can move between the two
+# venues would be taken within blocks, so its survival means it cannot move.
+BARRIER_SUSPECTED_BPS = 100.0
 
-def classify_dislocation(values, flip_threshold: float = BASIS_FLIP_THRESHOLD):
+
+def classify_dislocation(
+    values,
+    flip_threshold: float = BASIS_FLIP_THRESHOLD,
+    barrier_bps: float = BARRIER_SUSPECTED_BPS,
+):
     """Standing basis, or fluctuating dislocation? They mean opposite things.
 
     FLUCTUATING: the sign changes. The pool crosses the exchange price in both
@@ -760,6 +779,8 @@ def classify_dislocation(values, flip_threshold: float = BASIS_FLIP_THRESHOLD):
             "median_bps": (_stats.median(data) if data else None),
             "flip_threshold": flip_threshold,
             "n": len(data),
+            "barrier_suspected": None,
+            "barrier_threshold_bps": barrier_bps,
             "reason": (
                 f"{len(data)} observations is too few to distinguish a standing "
                 f"basis from a fluctuating one; {MIN_OBSERVATIONS_TO_CLASSIFY} needed"
@@ -772,11 +793,37 @@ def classify_dislocation(values, flip_threshold: float = BASIS_FLIP_THRESHOLD):
     # a fluctuating series has both sides well represented.
     minority = min(positive, negative) / len(data)
 
+    kind = "standing_basis" if minority <= flip_threshold else "fluctuating"
+    median = _stats.median(data)
+
+    # A LARGE gap that never closes is evidence the market cannot close it.
+    #
+    # This inverts how such a reading should be interpreted, and the inversion is the
+    # point. If a 456 bps gap on a liquid major were arbitrageable, it would not persist
+    # -- someone faster and cheaper would have taken it. Persistence at that size is
+    # therefore information about a barrier, not about an opportunity, and the barrier is
+    # what has to be found before the number means anything.
+    #
+    # Measured: BNB/WETH on Ethereum showed +455 bps, standing, on a pool with real
+    # liquidity and a price ratio well inside the plausible band, so neither the identity
+    # guard nor the collision guard fires. The barrier turned out to be settlement --
+    # 0xB8c77482... is the LEGACY BNB ERC-20, and BNB is native to BSC, so there is no
+    # withdrawal path from the exchange to that pool. The gap is the price of a stranded
+    # asset.
+    #
+    # Confirming the barrier needs Binance's signed withdrawal-network endpoint, which a
+    # read-only research process deliberately cannot reach. So this flags rather than
+    # concludes -- but it flags in the right direction, which "YES, clears the floor" did
+    # not.
+    barrier_suspected = kind == "standing_basis" and abs(median) >= barrier_bps
+
     return {
-        "kind": "standing_basis" if minority <= flip_threshold else "fluctuating",
+        "kind": kind,
         "sign_flip_fraction": minority,
-        "median_bps": _stats.median(data),
+        "median_bps": median,
         "flip_threshold": flip_threshold,
         "n": len(data),
+        "barrier_suspected": barrier_suspected,
+        "barrier_threshold_bps": barrier_bps,
         "reason": None,
     }

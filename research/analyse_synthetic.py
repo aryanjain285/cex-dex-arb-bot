@@ -22,7 +22,11 @@ from decimal import Decimal
 from research_config import research_config
 
 from src.exchange.univ3_math import notional_to_move_price
-from src.research.observations import ObservationStore, mid_dislocation_bps
+from src.research.observations import (
+    ObservationStore,
+    mid_dislocation_bps,
+    plausible_same_asset,
+)
 from src.research.report import classify_dislocation
 from src.research.statistics import describe, half_life_seconds
 
@@ -56,6 +60,10 @@ def main():
     series = defaultdict(list)
     depths = defaultdict(list)
     times = defaultdict(list)
+    # Markets whose pool and exchange prices cannot be the same asset. Held apart from
+    # the ranking rather than filtered silently: a collision is a finding about the
+    # dataset, and the one found so far was the largest apparent opportunity in it.
+    collisions = {}
     for observation in store.read_all():
         chain_weth = weth.get(observation.chain)
         if chain_weth is None:
@@ -66,6 +74,12 @@ def main():
         if value is None:
             continue
         key = (observation.cex_symbol, observation.chain, observation.pool_fee)
+        pool_price = observation.pool.spot_price()
+        if not base_is_token0 and pool_price and pool_price > 0:
+            pool_price = Decimal(1) / pool_price
+        if not plausible_same_asset(pool_price, observation.cex_mid):
+            collisions[key] = (pool_price, observation.cex_mid)
+            continue
         series[key].append(value)
         times[key].append(observation.ts)
         depths[key].append(notional_to_move_price(observation.pool, Decimal("0.01")))
@@ -77,6 +91,8 @@ def main():
     print(f"{'market':<34} {'n':>5} {'mean d':>9} {'med|d|':>8} {'p99|d|':>9} "
           f"{'floor':>7} {'clears':>7} {'kind':>15} {'half-life':>10}")
     any_clears = False
+    any_clears_real = False
+    barriers = []
     for key in sorted(series):
         values = series[key]
         signed = describe(values)
@@ -97,21 +113,58 @@ def main():
             if cadence else None
         )
         label = f"{key[0]} {key[1]} {key[2]}"
+        verdict = "YES" if clears else "no"
+        if clears and kind.get("barrier_suspected"):
+            # Flagged rather than counted. A gap this large that never changes sign
+            # cannot be arbitrageable -- if it were, it would already be gone -- so
+            # "clears the floor" is the wrong reading of it.
+            verdict = "BARRIER"
+            any_clears_real = False
+        elif clears:
+            any_clears_real = True
         print(f"{label:<34} {len(values):>5} "
               f"{(signed.get('mean') or 0):>9.1f} {median_abs:>8.1f} "
               f"{(magnitude.get('p99') or 0):>9.1f} {floor:>7.1f} "
-              f"{('YES' if clears else 'no'):>7} {kind['kind']:>15} "
+              f"{verdict:>7} {kind['kind']:>15} "
               f"{('-' if half is None else f'{half:.0f}s'):>10}")
+        if verdict == "BARRIER":
+            barriers.append((label, median_abs))
 
     print()
     print(f"floor = pool fee + {args.legs} x {args.taker_bps} bps taker. The synthetic")
     print("route pays for the ETH leg as well as the token leg, so it needs a larger")
     print("dislocation than a direct pair to be worth the same.")
-    if not any_clears:
+    if barriers:
         print()
-        print("NO market clears its floor on the median. The deepest pools available")
-        print("in this universe do not show a dislocation large enough to pay for the")
-        print("extra leg that reaching them requires.")
+        print("BARRIER, not opportunity:")
+        for label, magnitude in barriers:
+            print(f"  {label}: {magnitude:.0f} bps that never changes sign, on a pool")
+            print(f"    with real liquidity. A gap this size would not survive if it")
+            print(f"    could be arbitraged. Find the barrier -- settlement path,")
+            print(f"    legacy or wrapped representation, withdrawal network -- before")
+            print(f"    treating the number as an edge.")
+
+    if not any_clears_real:
+        print()
+        print("NO market clears its floor on a gap that could actually be harvested.")
+        print("The deepest pools in this universe do not show a dislocation large")
+        print("enough to pay for the extra leg that reaching them requires, and the")
+        print("only ones that appear to are flagged above.")
+
+    if collisions:
+        print()
+        print("=" * 108)
+        print("EXCLUDED -- the two venues cannot be quoting the same asset")
+        print("=" * 108)
+        for key, (pool_price, cex_price) in sorted(collisions.items()):
+            ratio = (pool_price / cex_price) if cex_price else None
+            print(f"  {key[0]:<28} {key[1]:<9} {key[2]:>5}  pool "
+                  f"{float(pool_price):.10f} vs exchange {float(cex_price):.10f}  "
+                  f"= {float(ratio):.2f}x")
+        print("  A ticker collision, not a dislocation. Both symbols are correct on")
+        print("  their own venue, so no symbol comparison can separate them -- only the")
+        print("  price can. Ranked rather than excluded, this would have been the")
+        print("  largest opportunity in the dataset.")
 
     print()
     print("1% depth actually observed (upper bound, assumes no tick crossed):")
