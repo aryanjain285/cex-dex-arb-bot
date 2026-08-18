@@ -740,25 +740,43 @@ class PairConfig(BaseModel):
 class SecretsConfig(BaseModel):
     binance_api_key: SecretStr
     binance_api_secret: SecretStr
-    dex_wallet_private_key: SecretStr
+    # None means "this process cannot sign". Research, recording, surveying and
+    # backtesting all read chain state and never sign, so requiring a key for them
+    # meant every observation process held real signing material for no reason --
+    # and made a placeholder key in .env the path of least resistance, which is
+    # worse than no file at all.
+    dex_wallet_private_key: Optional[SecretStr] = None
 
     @classmethod
-    def load(cls):
+    def load(cls, *, require_signing_key: bool = True):
+        """Read secrets from the environment.
+
+        `require_signing_key` defaults to True: a live run without a wallet must
+        still fail at startup rather than at the first execution. Read-only callers
+        opt out explicitly, and get a config that is structurally unable to sign.
+        """
         api_key = os.getenv("BINANCE_API_KEY", "")
         api_secret = os.getenv("BINANCE_API_SECRET", "")
         private_key = os.getenv("DEX_WALLET_PRIVATE_KEY", "")
 
-        if not private_key:
+        if not private_key and require_signing_key:
             raise ValueError("Critical: DEX_WALLET_PRIVATE_KEY is missing or empty in your .env file.")
         if not api_key:
             logger.warning("BINANCE_API_KEY  is not set; CEX functionality will be limited.")
         if not api_secret:
             logger.warning("BINANCE_API_SECRET  is not set; CEX functionality will be limited.")
+        if not private_key:
+            logger.info(
+                "no DEX_WALLET_PRIVATE_KEY: this process is read-only and cannot "
+                "sign transactions"
+            )
 
         return cls(
             binance_api_key=api_key,
             binance_api_secret=api_secret,
-            dex_wallet_private_key=private_key,
+            # Deliberately None, never a placeholder: a dummy key would load
+            # cleanly and then fail deep inside a signing path.
+            dex_wallet_private_key=private_key or None,
         )
 
 # Main AppConfig model
@@ -903,10 +921,39 @@ def load_config(
     pairs_path: str = "config/pairs.yaml",
     tokens_path: str = "config/tokens.yaml",
     scanner_path: str = "config/scanner.yaml",
-    discovered_pairs_path: str = "data/discovered_pairs.yaml"
+    discovered_pairs_path: str = "data/discovered_pairs.yaml",
+    *,
+    require_signing_key: bool = True,
+    env_file: Optional[str] = None,
 ) -> AppConfig:
-    """Loads configuration from YAML files and environment variables."""
-    load_dotenv()
+    """Loads configuration from YAML files and environment variables.
+
+    `require_signing_key=False` yields a config that cannot sign: for recorders,
+    surveys, backtests and any other read-only process. It is not a convenience --
+    it is the difference between an observation process that holds spending
+    authority and one that does not. See SecretsConfig.load.
+
+    `env_file` names the environment file explicitly. None keeps the original
+    behaviour (walk the tree for `.env`), so the live path is unchanged. A named
+    file that does not exist is an error rather than a fallback: `load_dotenv`
+    returns False and carries on, which would let a research run read the live
+    operator's endpoints while its own log claimed otherwise -- and every number it
+    produced would be attributed to the wrong configuration.
+    """
+    if env_file is None:
+        load_dotenv()
+    else:
+        env_path = Path(env_file)
+        if not env_path.exists():
+            raise FileNotFoundError(
+                f"env_file {env_file!r} does not exist. Refusing to fall back to "
+                f"the ambient environment: the resulting run would be attributed "
+                f"to a configuration it did not use."
+            )
+        # override=True: the named file is the authority for this process. Without
+        # it a variable already exported in the shell wins over the file the
+        # caller explicitly pointed at, which is the same attribution problem.
+        load_dotenv(env_path, override=True)
     # Load YAML files
     default_cfg_data = load_yaml_with_env(default_path)
     pairs_cfg_data = load_yaml_with_env(pairs_path)
@@ -923,7 +970,12 @@ def load_config(
         default_scanner_conf.update(scanner_yaml_conf)
         full_config_data['scanner'] = default_scanner_conf
 
-    # Parse with Pydantic
+    # Parse with Pydantic. Secrets are constructed here rather than left to
+    # AppConfig's default_factory so that read-only callers actually reach the
+    # relaxed path -- a default_factory takes no arguments.
+    full_config_data.setdefault(
+        "secrets", SecretsConfig.load(require_signing_key=require_signing_key)
+    )
     config = AppConfig(**full_config_data)
 
     # Load dynamically discovered pairs, if any

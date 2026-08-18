@@ -16,7 +16,7 @@ from ..core.config import DexConfig, NetworkConfig, SecretsConfig, TokenDetails
 from .price_oracle import NativePriceOracle
 from ..core.types import MarketPair, DexQuote, DexSwapParams, DexTxReceipt
 from .dex_base import DexClient
-from .errors import RpcError, classify_rpc_failure
+from .errors import ReadOnlyWalletError, RpcError, classify_rpc_failure
 from .rpc_limit import RpcLimiter
 
 TEN_THOUSAND = Decimal("10000")
@@ -100,7 +100,18 @@ class UniV3DexClient(DexClient):
         self.net_config = net_config
         self.secrets = secrets
         self.tokens_config = tokens_config  # Directly use the passed dictionary
-        self.user_address = Web3.to_checksum_address(Web3().eth.account.from_key(secrets.dex_wallet_private_key.get_secret_value()).address)
+        # None when no signing key was supplied. A read-only client is a real
+        # configuration -- the recorder, the survey and the backtest all quote
+        # pools without ever holding a wallet -- so construction must not require
+        # one. Every signing path guards on it explicitly below.
+        if secrets.dex_wallet_private_key is None:
+            self.user_address = None
+        else:
+            self.user_address = Web3.to_checksum_address(
+                Web3().eth.account.from_key(
+                    secrets.dex_wallet_private_key.get_secret_value()
+                ).address
+            )
         
         self.w3_instances: Dict[str, Web3] = {}
         for chain, rpc_url in net_config.rpc_urls.items():
@@ -136,6 +147,28 @@ class UniV3DexClient(DexClient):
             stale_grace_seconds=dex_config.native_price_stale_grace_seconds,
         )
         logger.info(f"UniV3DexClient initialised, address: {self.user_address}, supported chains: {list(self.w3_instances.keys())}")
+
+
+    def _sign_transaction(self, transaction: dict, chain: Optional[str] = None):
+        """Sign a transaction, or refuse loudly if this client is read-only.
+
+        Centralised deliberately. Each signing site used to reach into
+        `secrets.dex_wallet_private_key` itself, so a read-only client would have
+        raised AttributeError from inside web3 -- indistinguishable from a bug, at
+        the worst possible moment. One guarded helper means a new signing path
+        inherits the check instead of having to remember it.
+        """
+        if self.secrets.dex_wallet_private_key is None:
+            raise ReadOnlyWalletError(
+                "this client is read-only: no DEX_WALLET_PRIVATE_KEY was supplied, "
+                "so it cannot sign transactions. Research, recording and backtest "
+                "runs are read-only by design; if this is a live run, the wallet "
+                "key is missing from the environment."
+            )
+        w3 = self._w3(chain) if chain else Web3()
+        return w3.eth.account.sign_transaction(
+            transaction, self.secrets.dex_wallet_private_key.get_secret_value()
+        )
 
     def _to_atomic(self, amount: Decimal, decimals: int) -> int:
         return int(amount * (10**decimals))
@@ -527,7 +560,7 @@ class UniV3DexClient(DexClient):
             tx_params,
         )
         
-        signed_tx = w3.eth.account.sign_transaction(approve_tx, self.secrets.dex_wallet_private_key.get_secret_value())
+        signed_tx = self._sign_transaction(approve_tx)
         tx_hash = await self._rpc(
             chain, w3.eth.send_raw_transaction, signed_tx.raw_transaction
         )
@@ -624,7 +657,7 @@ class UniV3DexClient(DexClient):
                 router_contract.functions.exactInputSingle(swap_params_struct).build_transaction,
                 tx_params,
             )
-            signed_tx = w3.eth.account.sign_transaction(swap_tx, self.secrets.dex_wallet_private_key.get_secret_value())
+            signed_tx = self._sign_transaction(swap_tx)
             tx_hash = await self._rpc(
                 params.chain, w3.eth.send_raw_transaction, signed_tx.raw_transaction
             )

@@ -280,6 +280,18 @@ class V3Pool:
     # For the record, so a stored snapshot says which block it describes.
     block_number: Optional[int] = None
     address: Optional[str] = None
+    # The tick window this snapshot's liquidity data actually covers. Outside it
+    # nothing is known -- not "there is no liquidity", which is a different claim
+    # and produces a different number.
+    #
+    # These exist because "no more initialised ticks in the pool" and "no more
+    # initialised ticks inside the window I scanned" yield identical tick lists.
+    # Conflating them made a thin ARB pool quote 75% better than the deployed
+    # contract, with no flag raised. When None, the outermost recorded tick is used
+    # as the bound instead: assuming less knowledge than we have is safe, assuming
+    # more is what produced the defect.
+    known_lower_tick: Optional[int] = None
+    known_upper_tick: Optional[int] = None
 
     def __post_init__(self):
         if self.fee < 0 or self.fee >= FEE_DENOMINATOR:
@@ -308,6 +320,22 @@ class V3Pool:
             return candidates[-1] if candidates else None
         candidates = [t for t in self.ticks if t.tick > current]
         return candidates[0] if candidates else None
+
+    def _observed_bound_tick(self, zero_for_one: bool) -> Optional[int]:
+        """The furthest tick in the direction of travel whose liquidity is known.
+
+        The explicit scan window when the reader recorded one -- liquidity is
+        genuinely constant wherever no tick is initialised, so a scan that found no
+        ticks still prices exactly across its whole window. Otherwise the outermost
+        recorded tick, which under-claims knowledge rather than over-claiming it.
+        """
+        if zero_for_one:
+            if self.known_lower_tick is not None:
+                return self.known_lower_tick
+            return self.ticks[0].tick if self.ticks else None
+        if self.known_upper_tick is not None:
+            return self.known_upper_tick
+        return self.ticks[-1].tick if self.ticks else None
 
     def swap_exact_in(self, amount_in: int, zero_for_one: bool) -> int:
         """Output amount for an exact input, in integer token units.
@@ -355,9 +383,26 @@ class V3Pool:
 
             next_tick = self._next_initialised_tick(tick, zero_for_one)
             if next_tick is None:
-                target_sqrt_price = (
-                    MIN_SQRT_RATIO + 1 if zero_for_one else MAX_SQRT_RATIO - 1
-                )
+                # No further initialised tick INSIDE the observed window. The
+                # window edge is therefore the limit of what can be answered: the
+                # contract would keep crossing real ticks out there, and this
+                # snapshot has never seen them.
+                bound = self._observed_bound_tick(zero_for_one)
+                if bound is None:
+                    # Nothing observed in this direction at all.
+                    exhausted = True
+                    break
+                target_sqrt_price = sqrt_price_x96_from_tick(bound)
+                # Already at or beyond the edge: any further fill would be invented.
+                if (zero_for_one and sqrt_price <= target_sqrt_price) or (
+                    not zero_for_one and sqrt_price >= target_sqrt_price
+                ):
+                    exhausted = True
+                    break
+                # target_tick stays None: the window edge is a boundary of
+                # KNOWLEDGE, not an initialised tick, so no liquidity change is
+                # applied when the price reaches it. Reaching it means the answer
+                # ran out, which the `else` branch below records.
                 target_tick = None
             else:
                 target_sqrt_price = sqrt_price_x96_from_tick(next_tick.tick)
@@ -420,6 +465,13 @@ class V3Pool:
                 )
                 tick = target_tick.tick - 1 if zero_for_one else target_tick.tick
                 crossed += 1
+            elif target_tick is None and sqrt_price == target_sqrt_price:
+                # The price reached the edge of the observed window. Whatever is
+                # left is unanswerable, even if `remaining` happens to be 0 -- a
+                # swap that lands exactly on the boundary consumed the last of the
+                # data, and the next size up has none.
+                exhausted = True
+                break
             elif remaining <= 0:
                 break
             else:

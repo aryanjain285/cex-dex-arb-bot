@@ -80,3 +80,12 @@ def classify_rpc_failure(exc: BaseException) -> bool:
     if "revert" in text:
         return False
     return any(marker in text for marker in _TRANSPORT_MARKERS)
+
+
+class ReadOnlyWalletError(RuntimeError):
+    """Raised when a read-only client is asked to sign.
+
+    Its own type, not a bare RuntimeError: an operator seeing a failed execution
+    needs to distinguish "the wallet key is missing from this process" from "the
+    chain rejected the transaction". They have completely different fixes.
+    """

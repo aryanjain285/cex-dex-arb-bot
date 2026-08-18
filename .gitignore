@@ -42,3 +42,7 @@ node_modules/
 dashboard/backend/node_modules/
 dashboard/frontend/node_modules/
 dashboard/frontend/build/
+
+# Research environment: public endpoints only, but keep it out of the repo so
+# nobody's local edits (a paid RPC key, say) get committed.
+.env.research
