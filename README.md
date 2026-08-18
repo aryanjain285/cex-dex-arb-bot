@@ -34,6 +34,17 @@ The bot is architected to be modular, extensible, and performant, utilizing mode
   418 is treated as fatal rather than retried.
 - **Observability.** Prometheus metrics, and `OPERATIONS.md` alert rules written
   against series that actually exist.
+- **A research stack that records re-quotable state.** `src/research` stores raw
+  pool snapshots and full CEX ladders rather than decisions, so any size can be
+  priced later under any cost model — verified 44/44 exact against the deployed
+  QuoterV2 at the block each row recorded. On top of it: batch-means confidence
+  intervals that report the *effective* sample size (2,715 observations at 2s
+  cadence carry 34 independent facts), a latency model that freezes size and
+  direction at decision time so it cannot peek, and a time-scrambled negative
+  control. See `research/README.md`.
+- **Local Uniswap v3 math.** `univ3_math` reproduces the deployed QuoterV2 exactly
+  inside the tick range it observed, and *refuses* outside it — the previous
+  version extrapolated, which made a thin pool quote 75% better than the chain.
 
 ---
 
@@ -43,29 +54,70 @@ Honest state of the codebase, so you know what you are building on.
 
 ### The result that matters
 
-The engine measures correctly and the measurement says the trade is not there.
-Across 676 live evaluations on three pairs, plus on-chain surveys of 87 candidates
-across Ethereum, Arbitrum and Base:
+The engine measures correctly, and the measurement now has a mechanism behind it
+rather than just a sign. **The typical CEX-DEX dislocation equals the pool fee**,
+so a strategy needing the pool fee *plus* an exchange fee is short by the exchange
+fee at every tier.
 
-| | |
-|---|---|
-| Structural cost per trade | **27.7 bps** — 20.0 rotation, 7.5 taker fee, 0.2 gas |
-| Average gross dislocation, liquid pairs | **−1.5 to −2.0 bps** |
-| Best single gross observation in 676 | **+3.28 bps** |
-| Tightest gross of 60 measured survey candidates | **−3.41 bps** (WBTC on Arbitrum) |
-| Positive net edges found | 3, all traps: wrong asset in custody, wrong chain for settlement, wrong token |
-| Tradeable positive net edges found | **0** |
+Measured with swap prints, exact block timestamps and 1-second klines
+(`research/exact_swap_dislocation.py`):
 
-The placebo arm — the same order book priced against a deliberately 24-second-stale
-DEX quote — differs from the live arm by under 1 bps at the 10th and 90th
-percentiles. The gap to break-even is not being caused by latency.
+| pool | pool fee | median dislocation |
+|---|---|---|
+| ETH/USDC 0.05% Arbitrum | 5 bps | 4.69 |
+| ETH/USDT 0.05% Arbitrum | 5 bps | 4.70 |
+| ETH/USDC 0.30% Arbitrum | 30 bps | 22.38 |
+| ETH/USDT 0.30% Arbitrum | 30 bps | 30.30 |
 
-Run `python -m src.cli.main analyse` after any `paper` run to reproduce every one
-of those figures from the rows the run wrote itself.
+The 0.30% figures were predicted from the 0.05% ones before being measured. It
+follows from what an arbitrageur does: close a gap until the remainder no longer
+covers the cost, and the irreducible cost of using a pool is its fee. So
+competition arbitrages to the fee and stops, leaving its own cost basis on the
+table.
+
+It holds across a twenty-fold range of volatility — four windows from 2.88 to
+58.12 bps/min give medians of 2.85 to 5.81 bps — which is why raising the fee tier
+does nothing: it raises the available gap and the required gap equally.
+
+For a polling loop it is worse. Clock-sampled, 2,715 observations per market:
+
+| market | median | max | largest CEX fee that clears |
+|---|---|---|---|
+| ETH/USDC 0.05% | 2.67 | 7.40 | none at median; 2.33 bps at max |
+| ETH/USDT 0.05% | 2.70 | 6.85 | none at median; 1.77 bps at max |
+| USDC/USDT 0.05% | 1.11 | 1.21 | none at any percentile |
+
+The median does not cover the **pool fee alone**. A zero-fee exchange still loses
+about 2.9 bps at the median.
+
+Separately ruled out, each by its own measurement rather than by argument:
+
+| hypothesis | measurement | verdict |
+|---|---|---|
+| too slow | 12s of delay costs 0.10 bps; half-life 21–24s | not the constraint |
+| wrong size | profit curve over 10 sizes per observation, both directions | no size clears |
+| wrong fee tier | 0.30% pools give 22–30 bps and need 37.5 | tier is neutral |
+| wrong universe | 568 pools, 175 assets, 3 chains | 10 of the 14 deepest non-ETH Arbitrum pools had **zero swaps in an hour** |
+| wrong regime | 4 windows, 2.88–58.12 bps/min | median moves ~1 bps |
+
+Every positive found was a trap, and each produced a guard: a ticker collision
+(CoinGecko's MET is not Binance's MET, both `symbol()` calls correct), a legacy
+ERC-20 with no withdrawal path (BNB on Ethereum, +455 bps standing), an L1/L2
+bridging basis (WBTC/USDT, −11.93 bps with every observation negative), and empty
+pools reporting up to 3.9e52 bps because v3 keeps the price its creator set until
+someone trades.
+
+`research/FINDINGS.md` records all of it, including **four retractions** — results
+I believed and then disproved, kept in place with the measurement that overturned
+each. Three were timing artifacts; one was a single-hour result that two more hours
+contradicted.
 
 **Do not deploy capital against the current configuration.** What would change the
-answer is size, cost basis, or a token whose settlement path has been verified —
-not more code.
+answer is a cost above the pool fee near zero, which means maker orders at VIP8–9
+— and a resting maker order is not a hedge until it fills, so the DEX leg would
+carry unhedged inventory for an unbounded period. That risk is priced nowhere in
+this codebase, and pricing it is a prerequisite for evaluating the maker route
+rather than a refinement afterwards.
 
 ### Working and verified live
 
