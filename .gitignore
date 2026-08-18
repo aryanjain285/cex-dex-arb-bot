@@ -46,3 +46,10 @@ dashboard/frontend/build/
 # Research environment: public endpoints only, but keep it out of the repo so
 # nobody's local edits (a paid RPC key, say) get committed.
 .env.research
+
+# Recorded observations: a run's own data, not the repo's. Committing it would
+# ship one machine's measurements as everyone else's evidence -- the same
+# mistake as committing the runtime evaluation DB.
+data/observations.sqlite3
+data/observations*.sqlite3*
+research/targets_wide.json

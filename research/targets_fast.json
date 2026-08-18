@@ -1,0 +1,38 @@
+[
+  {
+    "base": "WETH",
+    "quote": "USDT",
+    "cex_symbol": "ETH/USDT",
+    "chain": "arbitrum",
+    "fee": 500,
+    "pool_address": "0x641C00A822e8b671738d32a431a4Fb6074E5c79d",
+    "base_address": "0x82aF49447D8a07e3bd95BD0d56f35241523fBab1",
+    "quote_address": "0xFd086bC7CD5C481DCC9C85ebE478A1C0b69FCbb9",
+    "base_decimals": 18,
+    "quote_decimals": 6
+  },
+  {
+    "base": "WETH",
+    "quote": "USDC",
+    "cex_symbol": "ETH/USDC",
+    "chain": "arbitrum",
+    "fee": 500,
+    "pool_address": "0xC6962004f452bE9203591991D15f6b388e09E8D0",
+    "base_address": "0x82aF49447D8a07e3bd95BD0d56f35241523fBab1",
+    "quote_address": "0xaf88d065e77c8cC2239327C5EDb3A432268e5831",
+    "base_decimals": 18,
+    "quote_decimals": 6
+  },
+  {
+    "base": "USDC",
+    "quote": "USDT",
+    "cex_symbol": "USDC/USDT",
+    "chain": "arbitrum",
+    "fee": 500,
+    "pool_address": "0xbcE73c2e5A623054B0e8e2428E956f4b9d0412a5",
+    "base_address": "0xaf88d065e77c8cC2239327C5EDb3A432268e5831",
+    "quote_address": "0xFd086bC7CD5C481DCC9C85ebE478A1C0b69FCbb9",
+    "base_decimals": 6,
+    "quote_decimals": 6
+  }
+]
