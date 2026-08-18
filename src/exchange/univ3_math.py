@@ -37,6 +37,7 @@ from decimal import Decimal
 from typing import Iterable, List, Optional, Sequence, Tuple
 
 __all__ = [
+    "notional_to_move_price",
     "Q96",
     "SwapResult",
     "MIN_TICK",
@@ -530,3 +531,33 @@ class V3Pool:
         the system has only ever asked about one fixed notional.
         """
         return [(size, self.price_for_amount_in(size, zero_for_one)) for size in sizes]
+
+
+def notional_to_move_price(pool: "V3Pool", fraction: Decimal) -> Decimal:
+    """Quote-token notional needed to move the price by `fraction`, from slot0 alone.
+
+    An UPPER BOUND on real depth: it assumes the whole move happens inside the current
+    tick range, and crossing a tick can only reduce liquidity. So a pool that fails this
+    test is definitely too thin, while one that passes is only a candidate -- anything
+    shortlisted needs a full tick read before any claim about capacity.
+
+    Why this rather than reporting active liquidity directly: L is unitless across pools
+    with different decimals and different prices. 10^24 means something entirely
+    different for USDC/USDT than for a token at $0.07, so ranking pools by L is
+    meaningless. A notional is comparable.
+
+    In v3 the token1 required to move the price between two points in one range is
+    L * (sqrt(Pb) - sqrt(Pa)), with sqrt prices in Q64.96.
+    """
+    if fraction <= 0:
+        raise ValueError(
+            f"fraction must be positive, got {fraction}; a zero move needs no "
+            f"notional and would report every pool as infinitely thin"
+        )
+    if pool.liquidity <= 0 or pool.sqrt_price_x96 <= 0:
+        return Decimal(0)
+
+    sqrt_a = Decimal(pool.sqrt_price_x96)
+    sqrt_b = sqrt_a * (Decimal(1) + fraction).sqrt()
+    raw_amount1 = Decimal(pool.liquidity) * (sqrt_b - sqrt_a) / Decimal(Q96)
+    return raw_amount1 / (Decimal(10) ** pool.decimals1)
