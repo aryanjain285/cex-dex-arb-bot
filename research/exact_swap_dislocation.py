@@ -101,6 +101,10 @@ async def main():
     parser.add_argument("--taker-bps", type=float, default=7.5)
     parser.add_argument("--max-blocks", type=int, default=900,
                         help="cap on block timestamp lookups")
+    parser.add_argument("--at", default=None,
+                        help="ISO UTC time to measure at, e.g. 2026-03-23T11:00:00. "
+                             "Located by binary search, since interpolation has already "
+                             "manufactured two retracted findings.")
     args = parser.parse_args()
 
     from src.exchange.univ3 import UniV3DexClient
@@ -111,12 +115,59 @@ async def main():
         args.chain, lambda: w3.eth.get_block(int(head))
     ))["timestamp"])
 
-    # Blocks are about 0.25s on Arbitrum; the exact span is read back below, so this only
-    # has to be roughly right.
-    start_block = max(1, head - int(args.minutes * 60 / 0.25))
-    start_ts = int((await client._rpc(
-        args.chain, lambda: w3.eth.get_block(int(start_block))
-    ))["timestamp"])
+    if args.at:
+        # A historical window, located by binary search on timestamps. 1-second klines
+        # are retained for the full 180 days, so the CEX side is second-resolution here
+        # too -- which is what makes a violent hour measurable at all. At 38 bps/min,
+        # one-minute klines carry up to 38 bps of matching noise, the same order as the
+        # signal.
+        target = datetime.fromisoformat(args.at).replace(tzinfo=timezone.utc)
+        target_ts = int(target.timestamp())
+        low = max(1, head - 150_000_000)
+        low_ts = int((await client._rpc(
+            args.chain, lambda: w3.eth.get_block(int(low))
+        ))["timestamp"])
+        if target_ts < low_ts:
+            print(f"{args.at} predates the log retention window "
+                  f"({datetime.fromtimestamp(low_ts, timezone.utc):%Y-%m-%d})")
+            return
+        lo, hi = low, head
+        searches = 0
+        while hi - lo > 1:
+            mid = (lo + hi) // 2
+            mid_ts = int((await client._rpc(
+                args.chain, lambda m=mid: w3.eth.get_block(int(m))
+            ))["timestamp"])
+            searches += 1
+            if abs(mid_ts - target_ts) <= 15:
+                lo = hi = mid
+                break
+            if mid_ts < target_ts:
+                lo = mid
+            else:
+                hi = mid
+        start_block = lo
+        start_ts = int((await client._rpc(
+            args.chain, lambda: w3.eth.get_block(int(start_block))
+        ))["timestamp"])
+        placement = abs(start_ts - target_ts)
+        print(f"located {args.at} at block {start_block:,} in {searches} searches, "
+              f"placement error {placement}s")
+        if placement > 60:
+            print("  refusing: placement error above 60s would itself manufacture "
+                  "tens of bps at high volatility")
+            return
+        head = min(head, start_block + int(args.minutes * 60 / 0.25))
+        head_ts = int((await client._rpc(
+            args.chain, lambda: w3.eth.get_block(int(head))
+        ))["timestamp"])
+    else:
+        # Blocks are about 0.25s on Arbitrum; the exact span is read back below, so this
+        # only has to be roughly right.
+        start_block = max(1, head - int(args.minutes * 60 / 0.25))
+        start_ts = int((await client._rpc(
+            args.chain, lambda: w3.eth.get_block(int(start_block))
+        ))["timestamp"])
     print(f"blocks {start_block:,}-{head:,} covering "
           f"{datetime.fromtimestamp(start_ts, timezone.utc):%H:%M:%S} to "
           f"{datetime.fromtimestamp(head_ts, timezone.utc):%H:%M:%S} UTC "
@@ -144,9 +195,10 @@ async def main():
 
     blocks = sorted({int(e["blockNumber"]) for e in events})
     if len(blocks) > args.max_blocks:
-        # Keep the most recent, so the sample stays contiguous rather than scattered --
-        # a scattered sample would need the klines for its whole span anyway.
-        blocks = blocks[-args.max_blocks:]
+        # Evenly spaced rather than most-recent, so a capped sample still covers the whole
+        # window. Taking only the tail of a violent hour would measure its last minutes.
+        step = len(blocks) / args.max_blocks
+        blocks = [blocks[int(i * step)] for i in range(args.max_blocks)]
         keep = set(blocks)
         events = [e for e in events if int(e["blockNumber"]) in keep]
         print(f"  capped to {len(blocks):,} blocks / {len(events):,} swaps")
